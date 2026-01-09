@@ -37,9 +37,10 @@ async def get_db():
         finally:
             await session.close()
 
-
 def _ensure_optional_columns(sync_conn):
-    """Ensure newly added columns exist (SQLite lacks automatic ALTER support)."""
+    dialect = sync_conn.dialect.name  # "sqlite", "postgresql", etc.
+    if dialect != "sqlite":
+        return
     try:
         result = sync_conn.execute(text("PRAGMA table_info(deals)"))
     except Exception:
@@ -62,4 +63,8 @@ def _ensure_optional_columns(sync_conn):
     if "location" not in existing:
         sync_conn.execute(
             text("ALTER TABLE deals ADD COLUMN location VARCHAR(200)")
+        )
+    if "last_ranked_at" not in existing:
+        sync_conn.execute(
+            text("ALTER TABLE deals ADD COLUMN last_ranked_at DATETIME")
         )

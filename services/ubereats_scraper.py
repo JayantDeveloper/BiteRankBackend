@@ -1,20 +1,47 @@
+# services/ubereats_scraper.py
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
+from contextlib import asynccontextmanager
 
-import httpx
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+from config import get_settings
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 USER_AGENT = (
-    "DealScoutBot/0.1 (+https://dealscout.example; contact: support@dealscout.local)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+# Price like "$3.49" or "US$ 3.49"
+PRICE_RE = re.compile(r"^(?:US\$|\$)\s*(\d+(?:\.\d{1,2})?)$", re.IGNORECASE)
+# Flexible price parsing (currency symbols optional)
+PRICE_RE_FLEXIBLE = re.compile(
+    r"(?:US\$|\$|USD|EUR|GBP|€|£)?\s*(\d+(?:[.,]\d{1,2})?)",
+    re.IGNORECASE,
+)
+
+# Calories like "450 Cal" or "450Cal" or "450 - 650 Cal"
+CAL_RE = re.compile(r"(\d+(?:\s*-\s*\d+)?)\s*Cal\.?", re.IGNORECASE)
+
+# Protein like "12g Protein" or "Protein 12g" (Uber strings vary)
+PROTEIN_RE_1 = re.compile(r"(\d+(?:\.\d+)?)\s*g\s*protein\b", re.IGNORECASE)
+PROTEIN_RE_2 = re.compile(r"\bprotein\b\s*(\d+(?:\.\d+)?)\s*g", re.IGNORECASE)
+
+# Sometimes nutrition line uses separators, e.g. "450 Cal • 12g Protein"
+NUTRITION_LINE_RE = re.compile(r"(?P<cal>\d+(?:\s*-\s*\d+)?)\s*Cal.*?(?P<protein>\d+(?:\.\d+)?)\s*g\s*Protein", re.IGNORECASE)
 
 
 @dataclass
@@ -23,6 +50,10 @@ class UberEatsMenuItem:
     name: str
     price: float
     category: Optional[str] = None
+
+    calories: Optional[int] = None
+    protein_grams: Optional[float] = None
+
     source_price_vendor: str = "ubereats"
     store_external_id: Optional[str] = None
     price_retrieved_at: datetime = datetime.now(timezone.utc)
@@ -30,260 +61,691 @@ class UberEatsMenuItem:
 
     def to_dict(self) -> dict:
         data = asdict(self)
-        # datetime is not JSON serializable; convert to isoformat for responses
         data["price_retrieved_at"] = self.price_retrieved_at.isoformat()
         return data
 
 
-class UberEatsScraper:
-    """
-    Lightweight scraper for Uber Eats store pages.
-    Strategy: extract state payloads embedded in <script> tags and walk them for menu items.
-    Falls back to scanning inline JSON blobs that resemble GraphQL caches.
-    """
+def _extract_store_id_from_url(url: str) -> str:
+    path = urlparse(url).path
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) >= 3 and segments[0] == "store":
+        return segments[2]
+    if len(segments) >= 2 and segments[0] == "store":
+        return segments[1]
+    return url
 
-    STATE_PATTERNS = [
-        re.compile(r"window\.__NUXT__\s*=\s*(\{.*?\});", re.DOTALL),
-        re.compile(r"window\.__APP_INITIAL_STATE__\s*=\s*(\{.*?\});", re.DOTALL),
-        re.compile(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});", re.DOTALL),
-        re.compile(r"self\.__NUXT__\s*=\s*(\{.*?\});", re.DOTALL),
-        re.compile(r"<script[^>]*id=[\"']__NEXT_DATA__[\"'][^>]*type=[\"']application/json[\"'][^>]*>(.*?)</script>", re.DOTALL),
-        re.compile(r"window\.__NEXT_DATA__\s*=\s*(\{.*?\});", re.DOTALL),
-        re.compile(r"window\.__RELAY_STORE__\s*=\s*(\{.*?\});", re.DOTALL),
-        re.compile(r"window\.__APOLLO_STATE__\s*=\s*(\{.*?\});", re.DOTALL),
+
+def _avg_or_single(cal_min: Optional[int], cal_max: Optional[int]) -> Optional[int]:
+    if cal_min is None and cal_max is None:
+        return None
+    if cal_min is None:
+        return cal_max
+    if cal_max is None:
+        return cal_min
+    return int(round((cal_min + cal_max) / 2))
+
+
+def _parse_calories(text: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Returns (min, max) calories if present, else (None, None)
+    """
+    if not text:
+        return None, None
+    m = CAL_RE.search(text)
+    if not m:
+        return None, None
+
+    cal_str = m.group(1).replace(" ", "")
+    if "-" in cal_str:
+        a, b = cal_str.split("-", 1)
+        try:
+            return int(a), int(b)
+        except ValueError:
+            return None, None
+
+    try:
+        v = int(cal_str)
+        return v, v
+    except ValueError:
+        return None, None
+
+
+def _parse_protein_grams(text: str) -> Optional[float]:
+    if not text:
+        return None
+
+    # Common combined line: "450 Cal • 12g Protein"
+    m = NUTRITION_LINE_RE.search(text)
+    if m:
+        try:
+            return float(m.group("protein"))
+        except ValueError:
+            pass
+
+    m1 = PROTEIN_RE_1.search(text)
+    if m1:
+        try:
+            return float(m1.group(1))
+        except ValueError:
+            return None
+
+    m2 = PROTEIN_RE_2.search(text)
+    if m2:
+        try:
+            return float(m2.group(1))
+        except ValueError:
+            return None
+
+    return None
+
+
+def _extract_price_flexible(text: str) -> Optional[float]:
+    """
+    More flexible price extraction that handles currency symbols, codes,
+    and plain numbers that look like prices.
+    """
+    if not text:
+        return None
+    text = text.strip()
+
+    # Direct dollar sign patterns (most reliable)
+    m = re.match(r"^(?:US\$|\$)\s*(\d+(?:\.\d{1,2})?)$", text, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+
+    # Currency code patterns
+    m = re.match(r"^(?:USD|EUR|GBP)\s*(\d+(?:\.\d{1,2})?)$", text, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+
+    # Require either currency OR a decimal to avoid parsing things like "46 min" as a price
+    decimal_number = re.match(r"^(\d{1,3}(?:[.,]\d{1,2}))$", text)
+    if decimal_number:
+        try:
+            val = float(decimal_number.group(1).replace(",", "."))
+            if 0.5 <= val < 1000:
+                return val
+        except ValueError:
+            pass
+
+    # Very flexible parse to catch "3,49" or "USD 3.49"
+    m = PRICE_RE_FLEXIBLE.search(text)
+    if m:
+        candidate = m.group(1).replace(",", ".")
+        try:
+            val = float(candidate)
+            if 0.5 <= val < 1000:
+                return val
+        except ValueError:
+            return None
+
+    return None
+
+
+def _extract_price_from_node(node: dict) -> Optional[float]:
+    """
+    Comprehensive price extraction from JSON node.
+    Checks many possible field names and formats (cents vs dollars).
+    """
+    if not isinstance(node, dict):
+        return None
+
+    price_fields = [
+        "price",
+        "displayPrice",
+        "itemPrice",
+        "basePrice",
+        "rawPrice",
+        "formattedPrice",
+        "priceString",
+        "displayPriceString",
+        "menuItemPrice",
+        "cost",
+        "amount",
+        "value",
+        "displayValue",
     ]
 
-    def __init__(self, timeout: float = 30.0):
-        self.timeout = timeout
+    # Structured price objects first
+    for field in ["price", "displayPrice", "itemPrice", "basePrice", "rawPrice"]:
+        price_obj = node.get(field)
+        if isinstance(price_obj, dict):
+            amt = price_obj.get("amount") or price_obj.get("value")
+            if isinstance(amt, int):
+                if amt >= 100:
+                    return amt / 100.0
+                if 0.5 <= amt < 1000:
+                    return float(amt)
+            if isinstance(amt, (float, str)):
+                try:
+                    val = float(amt)
+                    if val >= 100:
+                        return val / 100.0
+                    if 0.5 <= val < 1000:
+                        return val
+                except (ValueError, TypeError):
+                    pass
 
-    async def fetch_menu(self, store_url: str, restaurant_name: str = "McDonald's", location: Optional[str] = None) -> List[UberEatsMenuItem]:
-        html = await self._fetch(store_url)
-        store_id = self._extract_store_id(store_url)
+    # Numeric values directly
+    for field in price_fields:
+        val = node.get(field)
+        if isinstance(val, (int, float)):
+            fval = float(val)
+            if fval >= 100:
+                return fval / 100.0
+            if 0.5 <= fval < 1000:
+                return fval
 
-        payloads = self._extract_state_payloads(html)
-        items: List[UberEatsMenuItem] = []
-        for payload in payloads:
-            try:
-                parsed = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            extracted = list(self._extract_items(parsed))
-            if extracted:
-                logger.info("Extracted %d items from Uber Eats payload", len(extracted))
-            for item in extracted:
-                price = self._parse_price(item.get("price"))
-                if price is None:
-                    continue
-                name = self._clean_name(item.get("name"))
-                if not name:
-                    continue
-                category = self._clean_name(item.get("category"))
+    # Strings with flexible parsing
+    for field in price_fields:
+        val = node.get(field)
+        if isinstance(val, str):
+            parsed = _extract_price_flexible(val)
+            if parsed is not None:
+                return parsed
+
+    return None
+
+
+def _safe_get(obj: Any, keys: Iterable[str]) -> Any:
+    """
+    Try multiple keys in order for dict-like objects.
+    """
+    if not isinstance(obj, dict):
+        return None
+    for k in keys:
+        if k in obj and obj[k] is not None:
+            return obj[k]
+    return None
+
+
+def _walk(obj: Any) -> Iterable[Any]:
+    """
+    Generic deep walk generator through dict/list trees.
+    """
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        if isinstance(cur, dict):
+            for v in cur.values():
+                stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                stack.append(v)
+
+
+def _extract_items_from_embedded_json(
+    data: Any,
+    *,
+    restaurant_name: str,
+    store_id: str,
+    retrieved_at: datetime,
+    location: Optional[str],
+) -> List[UberEatsMenuItem]:
+    """
+    Attempt to extract structured items from Uber embedded state.
+    Uber changes shapes often, so this is intentionally defensive.
+    Hard cap at 500 items to prevent runaway extraction.
+    """
+    items: List[UberEatsMenuItem] = []
+
+    for node in _walk(data):
+        if len(items) >= 500:
+            logger.warning("⚠️ Hit 500 item cap during embedded JSON extraction")
+            break
+        if not isinstance(node, dict):
+            continue
+
+        # Heuristic: item nodes often have a title/name + a price/amount
+        name = _safe_get(node, ["title", "name", "displayName", "itemName"])
+        if not isinstance(name, str) or not (1 <= len(name.strip()) <= 120):
+            continue
+
+        price_val = _extract_price_from_node(node)
+        if price_val is None or not (0.5 <= price_val < 1000):
+            continue  # not an item we can use
+
+        # Category/section often appears in nearby fields
+        category = _safe_get(node, ["category", "sectionTitle", "sectionName", "menuSection"])
+        if isinstance(category, dict):
+            category = _safe_get(category, ["title", "name"])
+        if not isinstance(category, str):
+            category = None
+        else:
+            category = category.strip()[:80] if category.strip() else None
+
+        # Nutrition often nested
+        calories_min = calories_max = None
+        protein_grams: Optional[float] = None
+
+        nutrition = _safe_get(node, ["nutrition", "nutritionalInfo", "nutritionInfo"])
+        if isinstance(nutrition, dict):
+            # calories
+            cal_candidate = _safe_get(nutrition, ["calories", "calorie", "kcal"])
+            if isinstance(cal_candidate, (int, float, str)):
+                try:
+                    c = float(cal_candidate)
+                    calories_min = int(round(c))
+                    calories_max = calories_min
+                except ValueError:
+                    pass
+
+            # protein
+            prot_candidate = _safe_get(nutrition, ["protein", "proteinGrams", "protein_grams"])
+            if isinstance(prot_candidate, (int, float, str)):
+                try:
+                    protein_grams = float(prot_candidate)
+                except ValueError:
+                    pass
+
+            # Sometimes nutrition fields are strings like "450 Cal • 12g Protein"
+            nutrition_line = _safe_get(nutrition, ["displayText", "label", "summary"])
+            if isinstance(nutrition_line, str):
+                cmin, cmax = _parse_calories(nutrition_line)
+                if cmin is not None:
+                    calories_min, calories_max = cmin, cmax
+                p = _parse_protein_grams(nutrition_line)
+                if p is not None:
+                    protein_grams = p
+
+        # Sometimes nutrition is in a plain string nearby
+        if calories_min is None or protein_grams is None:
+            maybe_text = _safe_get(node, ["subtitle", "description", "nutritionLabel", "meta"])
+            if isinstance(maybe_text, str):
+                cmin, cmax = _parse_calories(maybe_text)
+                if cmin is not None and calories_min is None:
+                    calories_min, calories_max = cmin, cmax
+                p = _parse_protein_grams(maybe_text)
+                if p is not None and protein_grams is None:
+                    protein_grams = p
+
+        calories = _avg_or_single(calories_min, calories_max)
+
+        items.append(
+            UberEatsMenuItem(
+                restaurant=restaurant_name,
+                name=name.strip(),
+                price=float(price_val),
+                category=category,
+                calories=calories,
+                protein_grams=protein_grams,
+                store_external_id=store_id,
+                price_retrieved_at=retrieved_at,
+                location=location,
+                source_price_vendor="ubereats",
+            )
+        )
+
+    return items
+
+
+def _extract_embedded_state(html: str) -> Optional[Any]:
+    """
+    Try common script blobs used by Uber web apps.
+    """
+    # Some pages include JSON in script tags
+    patterns = [
+        re.compile(r"window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;\s*</script>", re.DOTALL),
+        re.compile(r"window\.__NUXT__\s*=\s*(\{.*?\})\s*;\s*</script>", re.DOTALL),
+        re.compile(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;\s*</script>", re.DOTALL),
+    ]
+
+    for pat in patterns:
+        m = pat.search(html)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            return json.loads(raw)
+        except Exception:
+            continue
+
+    # Also check for <script type="application/json" id="__NEXT_DATA__">...</script>
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if tag and tag.string:
+        try:
+            return json.loads(tag.string)
+        except Exception:
+            pass
+
+    return None
+
+
+def parse_menu_from_html_fallback(html: str) -> List[Dict]:
+    """
+    Fallback HTML parse using rich-text spans:
+      name -> price -> optional nutrition line
+    Improved to use flexible price detection and skip nutrition offsets properly.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    spans = [
+        s.get_text(" ", strip=True)
+        for s in soup.select('span[data-testid="rich-text"], span._a0n, span._wx')
+    ]
+    spans = [s for s in spans if s]
+
+    items: List[Dict] = []
+    seen = set()
+
+    i = 0
+    CAL_ONLY_RE = re.compile(r"^\s*\d[\d\s,.-]*\s*Cal\.?\s*$", re.IGNORECASE)
+
+    while i < len(spans) - 1:
+        name = spans[i]
+        # Skip tokens that are clearly calorie strings, not names
+        if CAL_ONLY_RE.match(name):
+            i += 1
+            continue
+        price = _extract_price_flexible(spans[i + 1])
+        if price is None:
+            i += 1
+            continue
+
+        nutrition_txt = ""
+        lookahead_limit = min(len(spans), i + 8)
+        for j in range(i + 2, lookahead_limit):
+            maybe_nutrition = spans[j]
+            if re.search(r"\d+\s*Cal|Protein|cal\.", maybe_nutrition, re.IGNORECASE):
+                nutrition_txt = maybe_nutrition
+                break
+
+        cmin, cmax = _parse_calories(nutrition_txt)
+        protein = _parse_protein_grams(nutrition_txt)
+
+        if 1 <= len(name) <= 120:
+            key = (name.lower(), price, cmin, cmax, protein)
+            if key not in seen:
+                seen.add(key)
                 items.append(
+                    {
+                        "name": name,
+                        "price_usd": price,
+                        "calories_min": cmin,
+                        "calories_max": cmax,
+                        "protein_grams": protein,
+                        "category": None,
+                    }
+                )
+
+        i += 2 if not nutrition_txt else 3
+
+    return items
+
+
+async def _scroll_to_load_menu(page: Page, passes: int = 12) -> None:
+    """
+    Gentler scroll loop to avoid skipping lazy-loaded sections.
+    Uses smaller steps and stops early if no new rich-text spans appear.
+    """
+    await page.wait_for_timeout(2000)
+    steps = max(0, passes)
+    last_count = 0
+    stable_runs = 0
+    for _ in range(steps):
+        await page.mouse.wheel(0, 800)
+        await page.wait_for_timeout(450)
+        try:
+            count = await page.locator('span[data-testid="rich-text"]').count()
+            if count == last_count:
+                stable_runs += 1
+            else:
+                stable_runs = 0
+            last_count = count
+            if stable_runs >= 3:
+                break  # no new nodes for a few cycles
+        except Exception:
+            continue
+    # Final crawl near bottom
+    for _ in range(3):
+        await page.mouse.wheel(0, 400)
+        await page.wait_for_timeout(400)
+
+
+class UberEatsScraper:
+    """
+    Playwright-based Uber Eats scraper.
+    Tries embedded JSON first (better nutrition/category), falls back to rich-text parsing.
+    """
+
+    def __init__(
+        self,
+        *,
+        headless: bool = True,
+        max_concurrent_scrapes: int = 1,
+        scroll_passes: int = 12,
+        debug: bool = False,
+        slow_mo_ms: int = 0,
+        trace: bool = False,
+        screenshots: bool = False,
+        timeout_ms: int = 60000,
+    ):
+        self.headless = headless
+        self.debug = debug
+        self.slow_mo_ms = slow_mo_ms
+        self.trace = trace
+        self.screenshots = screenshots
+        self.timeout_ms = timeout_ms
+        self.scroll_passes = scroll_passes
+        self._semaphore = asyncio.Semaphore(max_concurrent_scrapes)
+        self._routed_context_ids: set[int] = set()
+
+    @asynccontextmanager
+    async def shared_context(self) -> BrowserContext:
+        """
+        Shared browser/context for a job. Caller must close via context manager.
+        """
+        async with async_playwright() as p:
+            headless = False if self.debug else self.headless
+            slow_mo = self.slow_mo_ms if self.debug else 0
+            browser = await p.chromium.launch(headless=headless, slow_mo=slow_mo)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                user_agent=USER_AGENT,
+            )
+            try:
+                yield context
+            finally:
+                await context.close()
+                await browser.close()
+
+    async def fetch_menu(
+        self,
+        store_url: str,
+        restaurant_name: str = "Uber Eats Store",
+        location: Optional[str] = None,
+        shared_context: Optional[BrowserContext] = None,
+    ) -> List[UberEatsMenuItem]:
+        async with self._semaphore:
+            # 1) Determine store_id + retrieved_at
+            store_id = _extract_store_id_from_url(store_url)
+            retrieved_at = datetime.now(timezone.utc)
+
+            logger.info("🛵 UberEatsScraper: scraping %s (%s)", restaurant_name, store_url)
+
+            # 2) Get Playwright context
+            page = None
+            playwright_instance = None
+            browser = None
+            context = None
+            local_context = False
+
+            try:
+                if shared_context is not None:
+                    context = shared_context
+                    local_context = False
+                else:
+                    playwright_instance = await async_playwright().start()
+                    headless = False if self.debug else self.headless
+                    slow_mo = self.slow_mo_ms if self.debug else 0
+                    browser = await playwright_instance.chromium.launch(
+                        headless=headless, slow_mo=slow_mo
+                    )
+                    context = await browser.new_context(
+                        viewport={"width": 1280, "height": 800},
+                        locale="en-US",
+                        user_agent=USER_AGENT,
+                    )
+                    local_context = True
+
+                # 3) Create page, set timeouts
+                page = await context.new_page()
+                page.set_default_timeout(min(self.timeout_ms, 60000))
+                page.set_default_navigation_timeout(min(self.timeout_ms, 60000))
+
+                # 4) Routing: allow resources (no blocking) to avoid missing CSS/JS on some pages
+                # If you want to re-enable blocking, reintroduce the route handler here.
+
+                # 5) Navigate to store_url, wait for readiness, scroll to load menu, capture html
+                await page.goto(
+                    store_url,
+                    wait_until="load",
+                    timeout=max(self.timeout_ms or 60000, 90000),
+                )
+
+                ready_locator = page.locator('span[data-testid="rich-text"]')
+                try:
+                    await ready_locator.first.wait_for(state="visible", timeout=30000)
+                except Exception:
+                    # fallback: wait longer for heavy pages
+                    await page.wait_for_timeout(10000)
+
+                await _scroll_to_load_menu(page, self.scroll_passes)
+                html = await page.content()
+
+            except Exception as exc:
+                # 11) Screenshot on exception
+                if self.screenshots and page:
+                    os.makedirs("screenshots", exist_ok=True)
+                    try:
+                        await page.screenshot(
+                            path=os.path.join(
+                                "screenshots",
+                                f"ubereats-menu-fail-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.png",
+                            ),
+                            full_page=True,
+                        )
+                    except Exception:
+                        pass
+                logger.error("❌ Playwright scrape failed for %s: %s", store_url, exc)
+                raise
+
+            finally:
+                # 10) Always cleanup page
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                # If local context, close browser
+                if local_context:
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+                    if browser:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                    if playwright_instance:
+                        try:
+                            await playwright_instance.stop()
+                        except Exception:
+                            pass
+
+            # 6) Parse: embedded_state -> structured_items
+            embedded = _extract_embedded_state(html)
+            structured_items: List[UberEatsMenuItem] = []
+            if embedded is not None:
+                structured_items = _extract_items_from_embedded_json(
+                    embedded,
+                    restaurant_name=restaurant_name,
+                    store_id=store_id,
+                    retrieved_at=retrieved_at,
+                    location=location,
+                )
+
+            # Keep only plausible items (name, price sanity)
+            structured_items = [
+                it for it in structured_items if it.name and 0 < it.price < 1000
+            ]
+
+            # 7) Fallback parse (always run to fill gaps even if structured items exist)
+            fallback_items: List[UberEatsMenuItem] = []
+            parsed = parse_menu_from_html_fallback(html)
+            for d in parsed:
+                name = d.get("name")
+                price = d.get("price_usd")
+                if not name or price is None or price <= 0:
+                    continue
+                calories = _avg_or_single(d.get("calories_min"), d.get("calories_max"))
+                fallback_items.append(
                     UberEatsMenuItem(
                         restaurant=restaurant_name,
-                        name=name,
-                        price=price,
-                        category=category,
+                        name=str(name),
+                        price=float(price),
+                        category=None,
+                        calories=calories,
+                        protein_grams=d.get("protein_grams"),
                         store_external_id=store_id,
+                        price_retrieved_at=retrieved_at,
                         location=location,
+                        source_price_vendor="ubereats",
                     )
                 )
 
-        # Deduplicate by name/category
-        deduped: Dict[Tuple[str, Optional[str]], UberEatsMenuItem] = {}
-        for item in items:
-            key = (item.name.lower(), item.category.lower() if item.category else None)
-            if key not in deduped:
-                deduped[key] = item
+            # 8) Combine both sources, dedupe later
+            combined = structured_items + fallback_items
+            if not combined:
+                logger.warning("⚠️ No menu items parsed for %s", store_url)
+                return []
 
-        logger.info("Uber Eats scraper returning %d unique items", len(deduped))
-        return list(deduped.values())
+            # 9) Deduplicate
+            def score(it: UberEatsMenuItem) -> Tuple[int, int]:
+                return (
+                    1 if it.calories is not None else 0,
+                    1 if it.protein_grams is not None else 0,
+                )
 
-    async def _fetch(self, url: str) -> str:
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.8",
-            "Referer": "https://www.ubereats.com/",
-        }
-        async with httpx.AsyncClient(timeout=self.timeout, headers=headers) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            logger.info("Fetched Uber Eats store page: %s (%d bytes)", url, len(response.text))
-
-            # Debug: Save first 5000 chars to see structure
-            html_preview = response.text[:5000]
-            if "ubereats" in url.lower():
-                logger.debug(f"HTML preview (first 5000 chars):\n{html_preview}")
-
-            return response.text
-
-    def _extract_state_payloads(self, html: str) -> List[str]:
-        payloads: List[str] = []
-
-        # Direct regex matches
-        for pattern in self.STATE_PATTERNS:
-            matches = list(pattern.finditer(html))
-            if matches:
-                logger.info(f"Found {len(matches)} matches with pattern {pattern.pattern[:50]}...")
-            for match in matches:
-                payloads.append(match.group(1))
-
-        # Parse <script> tags as fallback
-        if not payloads:
-            logger.warning("No direct pattern matches found, parsing script tags...")
-            soup = BeautifulSoup(html, "html.parser")
-            scripts = soup.find_all("script")
-            logger.info(f"Found {len(scripts)} script tags total")
-
-            for script in scripts:
-                text = script.string or script.get_text()
-                if not text:
-                    continue
-
-                # Check for specific markers
-                has_relay = "__RELAY_STORE__" in text
-                has_apollo = "__APOLLO_STATE__" in text
-                has_initial = "__INITIAL_STATE__" in text
-                has_next = "__NEXT_DATA__" in text
-
-                if has_relay or has_apollo or has_initial or has_next:
-                    logger.info(f"Found promising script tag with markers: relay={has_relay}, apollo={has_apollo}, initial={has_initial}, next={has_next}")
-
-                for pattern in self.STATE_PATTERNS:
-                    match = pattern.search(text)
-                    if match:
-                        logger.info(f"Pattern matched in script tag: {pattern.pattern[:50]}...")
-                        payloads.append(match.group(1))
-
-                if has_relay or has_apollo:
-                    possible = self._extract_json_from_script(text)
-                    logger.info(f"Extracted {len(possible)} JSON objects from script")
-                    payloads.extend(possible)
-
-        logger.info(f"Total payloads extracted: {len(payloads)}")
-        return payloads
-
-    def _extract_json_from_script(self, script_text: str) -> List[str]:
-        """Attempt to pull inline JSON objects from a script when no direct pattern matches."""
-        payloads: List[str] = []
-        stack = []
-        start = None
-        for idx, char in enumerate(script_text):
-            if char == "{":
-                if not stack:
-                    start = idx
-                stack.append("{")
-            elif char == "}":
-                if stack:
-                    stack.pop()
-                    if not stack and start is not None:
-                        payloads.append(script_text[start : idx + 1])
-                        start = None
-        return payloads
-
-    def _extract_items(self, payload) -> Iterable[Dict[str, Optional[str]]]:
-        """Walk arbitrary nested JSON to find menu item-like structures."""
-
-        def walk(node, current_category=None):
-            if isinstance(node, dict):
-                name = node.get("title") or node.get("name") or node.get("displayName")
-                if name and isinstance(name, str):
-                    # Determine category candidate if node represents a section
-                    node_type = node.get("type") or node.get("__typename")
-                    if (
-                        node_type
-                        and isinstance(node_type, str)
-                        and node_type.lower() in {"category", "section", "menuitemsection"}
-                    ):
-                        current_category_local = name
-                    else:
-                        current_category_local = current_category
+            deduped: Dict[Tuple[str, Optional[str], float], UberEatsMenuItem] = {}
+            for it in combined:
+                key = (
+                    it.name.strip().lower(),
+                    it.category.lower().strip() if it.category else None,
+                    round(it.price, 2),
+                )
+                if key not in deduped:
+                    deduped[key] = it
                 else:
-                    current_category_local = current_category
+                    if score(it) > score(deduped[key]):
+                        deduped[key] = it
 
-                if self._looks_like_item(node):
-                    yield {
-                        "name": name or node.get("shortName"),
-                        "price": self._extract_price_field(node),
-                        "category": current_category,
-                    }
+            final_items = list(deduped.values())
 
-                for key, value in node.items():
-                    next_category = current_category_local
-                    if key.lower() in {"category", "section", "menu_items_section"} and isinstance(
-                        value, dict
-                    ):
-                        title = value.get("title") or value.get("name")
-                        if isinstance(title, str):
-                            next_category = title
-                    yield from walk(value, next_category)
-
-            elif isinstance(node, list):
-                for item in node:
-                    yield from walk(item, current_category)
-
-        return walk(payload)
-
-    def _looks_like_item(self, node: dict) -> bool:
-        if not isinstance(node, dict):
-            return False
-        name = node.get("title") or node.get("name") or node.get("displayName")
-        price = self._extract_price_field(node)
-        return isinstance(name, str) and price is not None
-
-    def _extract_price_field(self, node: dict):
-        candidates = [
-            node.get("price"),
-            node.get("priceInfo", {}).get("price"),
-            node.get("priceInfo", {}).get("unitPrice"),
-            node.get("itemPrice", {}).get("price"),
-            node.get("priceTag"),
-            node.get("amount"),
-            node.get("price_in_cents"),
-            node.get("priceInCents"),
-        ]
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            if isinstance(candidate, dict):
-                # Some nested objects store cents as 'amount'
-                amount = candidate.get("amount") or candidate.get("price")
-                if amount is not None:
-                    return amount
-                continue
-            return candidate
-        return None
-
-    def _parse_price(self, value) -> Optional[float]:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            amount = float(value)
-            if amount > 20:  # Likely cents
-                return round(amount / 100.0, 2)
-            return round(amount, 2)
-        if isinstance(value, str):
-            match = re.search(r"(\d+(?:\.\d{1,2})?)", value.replace(",", ""))
-            if match:
-                amount = float(match.group(1))
-                return round(amount, 2)
-        return None
-
-    def _clean_name(self, text: Optional[str]) -> Optional[str]:
-        if not text or not isinstance(text, str):
-            return None
-        cleaned = re.sub(r"[®™]", "", text)
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        return cleaned.strip()
-
-    def _extract_store_id(self, url: str) -> Optional[str]:
-        parsed = urlparse(url)
-        segments = [segment for segment in parsed.path.split("/") if segment]
-        if segments:
-            return segments[-1]
-        return None
+            # 12) Logging
+            logger.info(
+                "✅ UberEatsScraper: %d structured, %d fallback => %d final items for %s (%s)",
+                len(structured_items),
+                len(fallback_items),
+                len(final_items),
+                store_id,
+                store_url,
+            )
+            return final_items
 
 
-# Singleton
-ubereats_scraper = UberEatsScraper()
-
+ubereats_scraper = UberEatsScraper(
+    headless=settings.ubereats_headless,
+    max_concurrent_scrapes=1,
+    scroll_passes=settings.ubereats_scroll_passes,
+    debug=settings.ubereats_debug,
+    slow_mo_ms=settings.ubereats_slow_mo_ms,
+    trace=settings.ubereats_trace,
+    screenshots=settings.ubereats_screenshots,
+    timeout_ms=settings.ubereats_timeout_ms,
+)

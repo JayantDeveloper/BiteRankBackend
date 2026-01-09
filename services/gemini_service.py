@@ -1,152 +1,282 @@
-import google.generativeai as genai
-from config import get_settings
+# services/gemini_service.py
+import asyncio
+import json
 import logging
 import re
-import json
+import time
+from typing import Optional, Dict, Any, Tuple
+
+import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
+
+from config import get_settings
 from services.rate_limiter import gemini_rate_limiter
 from services.value_calculator import calculate_final_value_score
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Configure Gemini
-logger.info(f"Configuring Gemini with API key: {settings.gemini_api_key[:20] if settings.gemini_api_key else 'NOT SET'}...")
-genai.configure(api_key=settings.gemini_api_key)
+# Configure Gemini (do NOT log the key)
+if not settings.gemini_api_key:
+    logger.warning("⚠️ GEMINI_API_KEY is not set. Gemini nutrition estimation will fail.")
+else:
+    genai.configure(api_key=settings.gemini_api_key)
+
+
+_JSON_OBJ_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    """
+    Extract a JSON object from Gemini output.
+
+    Handles:
+    - ```json ... ```
+    - extra commentary around the JSON
+    - whitespace/newlines
+    """
+    if not text:
+        raise json.JSONDecodeError("empty response", "", 0)
+
+    cleaned = text.strip()
+
+    # Strip common markdown fences
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # If cleaned is pure JSON, parse it
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Otherwise, try to find the first {...} blob
+    m = _JSON_OBJ_RE.search(cleaned)
+    if not m:
+        raise json.JSONDecodeError("no JSON object found", cleaned, 0)
+
+    return json.loads(m.group(0))
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        n = int(float(value))
+        return n if n > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_nonneg_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        f = float(value)
+        return f if f >= 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 class GeminiService:
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
+        # Keep model configurable if you ever want to swap
+        model_name = getattr(settings, "gemini_model", None) or "gemini-2.5-flash"
+        self.model = genai.GenerativeModel(model_name)
+        self._circuit_open_until: float = 0.0
+        self._circuit_cooldown_seconds: int = getattr(settings, "gemini_circuit_cooldown_seconds", 60)
+        self._cache_ttl_seconds: int = getattr(settings, "gemini_cache_ttl_seconds", 3600)
+        # key -> (expires_at, (calories, protein))
+        self._nutrition_cache: Dict[Tuple[str, str], Tuple[float, Tuple[int, float]]] = {}
+        self._lock = asyncio.Lock()
+
+    def _is_circuit_open(self) -> bool:
+        return time.time() < self._circuit_open_until
+
+    def is_circuit_open(self) -> bool:
+        return self._is_circuit_open()
+
+    def _open_circuit(self) -> None:
+        self._circuit_open_until = time.time() + max(1, self._circuit_cooldown_seconds)
+        logger.warning(
+            "🚫 Gemini circuit opened for %s seconds due to quota exhaustion",
+            self._circuit_cooldown_seconds,
+        )
+
+    async def _get_cached_nutrition(self, restaurant: str, item: str) -> Optional[Tuple[int, float]]:
+        key = (restaurant.lower().strip(), item.lower().strip())
+        now = time.time()
+        if key in self._nutrition_cache:
+            expires_at, data = self._nutrition_cache[key]
+            if expires_at > now:
+                logger.info("🗂️ Using cached Gemini nutrition for %s | %s", restaurant, item)
+                return data
+            self._nutrition_cache.pop(key, None)
+        return None
+
+    async def _cache_nutrition(self, restaurant: str, item: str, calories: int, protein: float) -> None:
+        key = (restaurant.lower().strip(), item.lower().strip())
+        expires_at = time.time() + max(30, self._cache_ttl_seconds)
+        self._nutrition_cache[key] = (expires_at, (calories, protein))
+
+    async def _generate_content(self, prompt: str) -> str:
+        """
+        google.generativeai is sync; run in a thread so we don't block FastAPI's event loop.
+        """
+        def _call() -> str:
+            resp = self.model.generate_content(prompt)
+            # resp.text is usually present; guard anyway
+            return (getattr(resp, "text", None) or "").strip()
+
+        return await asyncio.to_thread(_call)
 
     async def score_deal(
         self,
         item_name: str,
         restaurant_name: str,
         price: float,
-        calories: int = None,
-        protein_grams: float = None,
+        calories: Optional[int] = None,
+        protein_grams: Optional[float] = None,
         description: str = "",
         portion_size: str = "",
-        deal_type: str = ""
+        deal_type: str = "",
     ) -> dict:
         """
         Calculate value score from nutrition data.
         If nutrition data is missing, estimate using Gemini.
 
-        Returns:
-            dict with value_score, satiety_score, calories, protein_grams, price_per_calorie
+        Returns dict with:
+          value_score, satiety_score, calories, protein_grams, price_per_calorie
+        Returns None when estimation is unavailable (e.g., circuit open or errors).
         """
-        logger.info(f"🤖 Analyzing deal: {item_name} from {restaurant_name} at ${price}")
+        if price is None or price <= 0:
+            raise ValueError(f"Invalid price: {price}")
 
-        # If nutrition data is provided, use it directly (no API call!)
-        if calories and calories > 0:
-            if protein_grams is None:
-                protein_grams = 0  # Default to 0 if not provided
+        item_name = (item_name or "").strip()
+        restaurant_name = (restaurant_name or "").strip()
 
-            logger.info(f"✅ Using provided nutrition: {calories} cal, {protein_grams}g protein")
+        logger.info("🤖 Scoring deal: %s | %s | $%.2f", restaurant_name, item_name, price)
 
-            # Calculate value score directly
-            scores = calculate_final_value_score(calories, protein_grams, price)
+        # ---- Fast path: user/scraper provided calories ----
+        if calories is not None and calories > 0:
+            # If protein missing, treat as 0 for scoring (but keep return consistent)
+            protein_for_calc = protein_grams if protein_grams is not None else 0.0
+
+            logger.info(
+                "✅ Using provided nutrition (no Gemini call): %s cal, %sg protein",
+                calories,
+                protein_for_calc,
+            )
+
+            scores = calculate_final_value_score(calories, protein_for_calc, price)
 
             return {
                 "value_score": scores["value_score"],
                 "satiety_score": scores["satiety_score"],
                 "price_per_calorie": scores["price_per_calorie"],
-                "calories": calories,
-                "protein_grams": protein_grams
+                "calories": int(calories),
+                "protein_grams": float(protein_for_calc),
             }
 
-        # Otherwise, estimate using Gemini
-        logger.warning(f"⚠️ No nutrition data provided, estimating with Gemini...")
+        # ---- Slow path: estimate using Gemini ----
+        logger.warning("⚠️ Missing calories; estimating with Gemini for %s (%s)", item_name, restaurant_name)
 
-        try:
-            # Respect rate limits
-            await gemini_rate_limiter.acquire()
+        cached = await self._get_cached_nutrition(restaurant_name, item_name)
+        if cached:
+            est_calories, est_protein = cached
+            scores = calculate_final_value_score(est_calories, est_protein, price)
+            return {
+                "value_score": scores["value_score"],
+                "satiety_score": scores["satiety_score"],
+                "price_per_calorie": scores["price_per_calorie"],
+                "calories": est_calories,
+                "protein_grams": est_protein,
+            }
 
-            prompt = f"""Estimate the nutritional content of this fast food item/deal:
+        if self._is_circuit_open():
+            logger.warning(
+                "⏩ Skipping Gemini call (circuit open due to prior quota exhaustion); using defaults",
+            )
+            return None
+
+        # Respect rate limits
+        await gemini_rate_limiter.acquire()
+
+        prompt = f"""Estimate the nutritional content of this fast food item/deal.
 
 Item: {item_name}
 Restaurant: {restaurant_name}
-Description: {description or 'No additional description'}
-Portion Size: {portion_size or 'Standard'}
+Deal Type: {deal_type or "Unknown"}
+Description: {description or "No additional description"}
+Portion Size: {portion_size or "Standard"}
 
-Based on typical {restaurant_name} items and the description, estimate:
-1. Total calories (all items combined if it's a meal/combo)
-2. Total protein in grams (all items combined)
+Estimate:
+1) Total calories (integer)
+2) Total protein in grams (number)
 
-Be realistic based on actual fast food nutrition data.
-
-Return ONLY a JSON object with this exact format:
+Return ONLY a JSON object with EXACT keys:
 {{"calories": <number>, "protein": <number>}}
 
-Example responses:
+Examples:
 {{"calories": 1200, "protein": 45}}
-{{"calories": 650, "protein": 28}}"""
+{{"calories": 650, "protein": 28}}
+"""
 
-            logger.info(f"📡 Calling Gemini API for nutrition estimation...")
-            response = self.model.generate_content(prompt)
-            logger.info(f"✅ Gemini responded!")
+        response_text = ""
+        try:
+            logger.info("📡 Calling Gemini API for nutrition estimation...")
+            response_text = await self._generate_content(prompt)
+            logger.info("✅ Gemini responded")
 
-            # Extract JSON from response
-            response_text = response.text.strip()
-            logger.info(f"📝 Gemini response: {response_text}")
+            nutrition = _extract_json_object(response_text)
 
-            # Try to parse JSON
-            # Remove markdown code blocks if present
-            response_text = re.sub(r'```json\s*|\s*```', '', response_text)
+            est_calories = _coerce_positive_int(nutrition.get("calories"))
+            est_protein = _coerce_nonneg_float(nutrition.get("protein"))
 
-            nutrition_data = json.loads(response_text)
+            # If Gemini gives garbage, fall back to defaults
+            if est_calories is None:
+                logger.error("❌ Gemini returned invalid calories. Raw=%s | text=%s", nutrition.get("calories"), response_text)
+                est_calories = 600
 
-            calories = int(nutrition_data.get('calories', 0))
-            protein = float(nutrition_data.get('protein', 0))
+            if est_protein is None:
+                # protein can reasonably be 0, but if missing/invalid, use a conservative default
+                est_protein = 20.0
 
-            if calories <= 0:
-                logger.error(f"❌ Invalid calories: {calories}")
-                # Use reasonable defaults
-                calories = 600
-                protein = 20
+            logger.info("🍔 Estimated nutrition: %s cal, %sg protein", est_calories, est_protein)
 
-            logger.info(f"🍔 Estimated nutrition: {calories} cal, {protein}g protein")
+            await self._cache_nutrition(restaurant_name, item_name, est_calories, est_protein)
 
-            # Calculate value score using our formula
-            scores = calculate_final_value_score(calories, protein, price)
+            scores = calculate_final_value_score(est_calories, est_protein, price)
 
             return {
                 "value_score": scores["value_score"],
                 "satiety_score": scores["satiety_score"],
                 "price_per_calorie": scores["price_per_calorie"],
-                "calories": calories,
-                "protein_grams": protein
+                "calories": est_calories,
+                "protein_grams": est_protein,
             }
 
+        except ResourceExhausted as e:
+            retry_delay = None
+            try:
+                retry_delay = e.retry_delay.total_seconds() if hasattr(e, "retry_delay") else None
+            except Exception:
+                retry_delay = None
+            logger.error(
+                "❌ Gemini quota exhausted (429). retry_delay=%s; opening circuit breaker",
+                retry_delay,
+            )
+            self._open_circuit()
         except json.JSONDecodeError as e:
-            logger.error(f"❌ Failed to parse Gemini JSON response: {e}")
-            logger.error(f"Response was: {response_text}")
-            # Use defaults
-            calories, protein = 600, 20
-            scores = calculate_final_value_score(calories, protein, price)
-            return {
-                "value_score": scores["value_score"],
-                "satiety_score": scores["satiety_score"],
-                "price_per_calorie": scores["price_per_calorie"],
-                "calories": calories,
-                "protein_grams": protein
-            }
+            logger.error("❌ Failed to parse Gemini JSON response: %s", e)
+            logger.error("Gemini raw text was: %s", response_text)
 
         except Exception as e:
-            logger.error(f"Error scoring deal with Gemini: {e}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            logger.error(f"Full error details:", exc_info=True)
-            # Return defaults
-            calories, protein = 600, 20
-            scores = calculate_final_value_score(calories, protein, price)
-            return {
-                "value_score": scores["value_score"],
-                "satiety_score": scores["satiety_score"],
-                "price_per_calorie": scores["price_per_calorie"],
-                "calories": calories,
-                "protein_grams": protein
-            }
+            logger.error("❌ Error scoring deal with Gemini: %s", e, exc_info=True)
+
+        # No safe estimate available
+        return None
 
 
 # Singleton instance

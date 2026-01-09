@@ -1,60 +1,48 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, and_
-from typing import List, Optional
-from datetime import datetime
-import logging
+import asyncio
 import json
-import base64
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import logging
+from datetime import datetime, timedelta
+from typing import List, Optional
+from urllib.parse import urlparse
 
-from database import get_db
-from models import Deal
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, desc, select, asc, case
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database import async_session_maker, get_db
+from models import Deal, ScrapeJob
 from schemas import (
     DealCreate,
     DealUpdate,
     DealResponse,
     RankingResponse,
     UberEatsImportRequest,
+    LocationSuggestionResponse,
+    ScrapeJobResponse,
 )
-from services.gemini_service import gemini_service
 from services.menu_scraper import menu_scraper
 from services.ubereats_scraper import ubereats_scraper
 from services.ubereats_store_search import ubereats_store_search
+from services.value_calculator import (
+    calculate_final_value_score,
+    classify_item_category,
+    estimate_nugget_nutrition,
+    estimate_nutrition_heuristic,
+)
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+settings = get_settings()
 
 SUPPORTED_UBER_EATS_RESTAURANTS = [
     "McDonald's",
-    "KFC",
     "Taco Bell",
-    "Wendy's",
-    "Burger King",
-    "Chick-fil-A",
-    "Subway",
-    "Popeyes",
+    "KFC",
 ]
-
-
-def _build_pl_payload(location: str, lat: float, lon: float) -> str:
-    payload = {
-        "address": location,
-        "latitude": round(lat, 6),
-        "longitude": round(lon, 6),
-        "reference": f"manual:{round(lat,6)},{round(lon,6)}",
-        "referenceType": "manual",
-    }
-    json_payload = json.dumps(payload, separators=(",", ":"))
-    return base64.urlsafe_b64encode(json_payload.encode("utf-8")).decode("utf-8").rstrip("=")
-
-
-def _with_query_params(url: str, **params: str) -> str:
-    parts = list(urlparse(url))
-    query = dict(parse_qsl(parts[4]))
-    query.update({k: v for k, v in params.items() if v is not None})
-    parts[4] = urlencode(query)
-    return urlunparse(parts)
+STORE_TIMEOUT = 120
+STORE_CONCURRENCY = 3
+UBEREATS_CACHE = {}
 
 
 def _extract_store_id_from_url(url: str) -> str:
@@ -92,6 +80,40 @@ def _apply_score_results(
     deal.last_ranked_at = datetime.utcnow()
 
 
+def _compute_score_without_ai(
+    *,
+    item_name: str,
+    restaurant_name: str,
+    price: float,
+    calories: Optional[int],
+    protein_grams: Optional[float],
+    category: str = "",
+    description: str = "",
+) -> Optional[dict]:
+    """
+    Deterministic scoring: use provided nutrition, else heuristics. Returns None when unavailable.
+    """
+    if price is None or price <= 0:
+        return None
+
+    cal = calories if calories and calories > 0 else None
+    protein = protein_grams if protein_grams is not None else 0.0
+
+    if cal is None or cal <= 0:
+        est = estimate_nutrition_heuristic(item_name, category=category, description=description)
+        if est and est.get("calories"):
+            cal = est["calories"]
+            protein = est.get("protein_grams", protein)
+
+    if cal is None or cal <= 0:
+        return None
+
+    scores = calculate_final_value_score(cal, protein or 0.0, price)
+    scores["calories"] = cal
+    scores["protein_grams"] = protein or 0.0
+    return scores
+
+
 def _resolve_scraper_slugs(inputs: Optional[List[str]]) -> List[str]:
     """Normalize restaurant identifiers for scraper endpoints."""
     if not inputs:
@@ -116,11 +138,21 @@ def _resolve_scraper_slugs(inputs: Optional[List[str]]) -> List[str]:
     return normalized
 
 
+def _cache_key(location: str, restaurants: List[str]) -> str:
+    loc_norm = (location or "").strip().lower()
+    rest_norm = "|".join(sorted(r.strip().lower() for r in (restaurants or [])))
+    return f"{loc_norm}__{rest_norm}"
+
+
 @router.get("/deals", response_model=List[DealResponse])
 async def get_deals(
     restaurant: Optional[str] = None,
     category: Optional[str] = None,
-    limit: int = Query(default=10, le=100),
+    limit: int = Query(default=10, le=500),
+    sort_by: str = Query(
+        default="value_score",
+        description="value_score|price|price_per_calorie|price_per_protein|protein_grams|calories",
+    ),
     active_only: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
@@ -130,6 +162,7 @@ async def get_deals(
     filters = []
     if active_only:
         filters.append(Deal.is_active == True)
+    filters.append(Deal.price > 0)
     if restaurant:
         filters.append(Deal.restaurant_name == restaurant)
     if category:
@@ -138,7 +171,28 @@ async def get_deals(
     if filters:
         query = query.where(and_(*filters))
 
-    query = query.order_by(desc(Deal.value_score)).limit(limit)
+    price_per_protein = case(
+        (Deal.protein_grams.is_(None), 9999999),
+        (Deal.protein_grams <= 0, 9999999),
+        else_=Deal.price / Deal.protein_grams,
+    )
+
+    sort_options = {
+        "value_score": desc(Deal.value_score),
+        "price": asc(Deal.price),
+        "price_per_calorie": asc(Deal.price_per_calorie),
+        "price_per_protein": asc(price_per_protein),
+        "protein_grams": desc(Deal.protein_grams),
+        "calories": asc(Deal.calories),
+    }
+
+    if sort_by not in sort_options:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid sort_by. Use one of: value_score, price, price_per_calorie, price_per_protein, protein_grams, calories.",
+        )
+
+    query = query.order_by(sort_options[sort_by]).limit(limit)
 
     result = await db.execute(query)
     deals = result.scalars().all()
@@ -148,13 +202,14 @@ async def get_deals(
 
 @router.get("/deals/top", response_model=List[DealResponse])
 async def get_top_deals(
-    limit: int = Query(default=10, le=100),
+    limit: int = Query(default=10, le=500),
     db: AsyncSession = Depends(get_db),
 ):
     """Get top N deals by value score"""
     query = (
         select(Deal)
         .where(Deal.is_active == True)
+        .where(Deal.price > 0)
         .order_by(desc(Deal.value_score))
         .limit(limit)
     )
@@ -200,26 +255,27 @@ async def create_deal(
     # Optionally rank immediately
     if auto_rank:
         try:
-            logger.info("Calling Gemini to rank: %s", deal.item_name)
             provided_calories = deal.calories
             provided_protein = deal.protein_grams
-            result = await gemini_service.score_deal(
+            result = _compute_score_without_ai(
                 item_name=deal.item_name,
                 restaurant_name=deal.restaurant_name,
                 price=deal.price,
                 calories=provided_calories,
                 protein_grams=provided_protein,
+                category=deal.category or "",
                 description=deal.description or "",
-                portion_size=deal.portion_size or "",
-                deal_type=deal.deal_type or "",
             )
-            _apply_score_results(
-                deal,
-                result,
-                provided_calories=provided_calories,
-                provided_protein=provided_protein,
-            )
-            logger.info("Deal auto-ranked: %s = %s", deal.item_name, result["value_score"])
+            if result:
+                _apply_score_results(
+                    deal,
+                    result,
+                    provided_calories=provided_calories,
+                    provided_protein=provided_protein,
+                )
+                logger.info("Deal auto-ranked (heuristic): %s = %s", deal.item_name, result["value_score"])
+            else:
+                logger.warning("Skipping ranking (missing nutrition and no heuristic) for %s", deal.item_name)
         except Exception as e:
             logger.error("Error auto-ranking deal: %s", e)
 
@@ -270,7 +326,7 @@ async def delete_deal(deal_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/deals/{deal_id}/rank", response_model=RankingResponse)
 async def rank_deal(deal_id: int, db: AsyncSession = Depends(get_db)):
-    """Rank a single deal using Gemini AI"""
+    """Rank a single deal using deterministic nutrition or heuristics"""
     result = await db.execute(select(Deal).where(Deal.id == deal_id))
     deal = result.scalar_one_or_none()
 
@@ -280,25 +336,24 @@ async def rank_deal(deal_id: int, db: AsyncSession = Depends(get_db)):
     previous_score = deal.value_score
 
     try:
-        provided_calories = deal.calories
-        provided_protein = deal.protein_grams
-        result = await gemini_service.score_deal(
+        result = _compute_score_without_ai(
             item_name=deal.item_name,
             restaurant_name=deal.restaurant_name,
             price=deal.price,
-            calories=provided_calories,
-            protein_grams=provided_protein,
+            calories=deal.calories,
+            protein_grams=deal.protein_grams,
+            category=deal.category or "",
             description=deal.description or "",
-            portion_size=deal.portion_size or "",
-            deal_type=deal.deal_type or "",
         )
+        if not result:
+            raise ValueError("Missing nutrition; unable to rank without AI")
 
         new_score = result["value_score"]
         _apply_score_results(
             deal,
             result,
-            provided_calories=provided_calories,
-            provided_protein=provided_protein,
+            provided_calories=deal.calories,
+            provided_protein=deal.protein_grams,
         )
 
         await db.commit()
@@ -332,7 +387,7 @@ async def rank_all_deals(
     ),
     db: AsyncSession = Depends(get_db),
 ):
-    """Rank all deals using Gemini AI with parallel processing"""
+    """Rank all deals using deterministic nutrition or heuristics"""
     import asyncio
 
     query = select(Deal)
@@ -357,25 +412,24 @@ async def rank_all_deals(
         previous_score = d.value_score
 
         try:
-            provided_calories = d.calories
-            provided_protein = d.protein_grams
-            result = await gemini_service.score_deal(
+            result = _compute_score_without_ai(
                 item_name=d.item_name,
                 restaurant_name=d.restaurant_name,
                 price=d.price,
-                calories=provided_calories,
-                protein_grams=provided_protein,
+                calories=d.calories,
+                protein_grams=d.protein_grams,
+                category=d.category or "",
                 description=d.description or "",
-                portion_size=d.portion_size or "",
-                deal_type=d.deal_type or "",
             )
+            if not result:
+                raise ValueError("Missing nutrition; unable to rank without AI")
 
             new_score = result["value_score"]
             _apply_score_results(
                 d,
                 result,
-                provided_calories=provided_calories,
-                provided_protein=provided_protein,
+                provided_calories=d.calories,
+                provided_protein=d.protein_grams,
             )
 
             logger.info("✅ Ranked deal %s: %s -> %s", d.id, previous_score, new_score)
@@ -563,23 +617,31 @@ async def import_scraped_menus(
                         else deal.protein_grams
                     )
 
-                    scores = await gemini_service.score_deal(
+                    scores = _compute_score_without_ai(
                         item_name=deal.item_name,
                         restaurant_name=deal.restaurant_name,
                         price=deal.price,
                         calories=calories_arg,
                         protein_grams=protein_arg,
+                        category=deal.category or "",
                         description=deal.description or "",
-                        portion_size=deal.portion_size or "",
-                        deal_type=deal.deal_type or "",
                     )
-                    _apply_score_results(
-                        deal,
-                        scores,
-                        provided_calories=calories_arg,
-                        provided_protein=protein_arg,
-                    )
-                    ranked += 1
+                    if scores:
+                        _apply_score_results(
+                            deal,
+                            scores,
+                            provided_calories=calories_arg,
+                            provided_protein=protein_arg,
+                        )
+                        ranked += 1
+                    else:
+                        skipped.append(
+                            {
+                                "restaurant": restaurant_name,
+                                "item": name,
+                                "reason": "missing_nutrition",
+                            }
+                        )
                 except Exception as exc:
                     logger.error(
                         "Failed to auto-rank scraped deal %s - %s: %s",
@@ -607,274 +669,461 @@ async def import_scraped_menus(
     }
 
 
-@router.post("/scrape/ubereats")
+# --- UberEats Debug/Test Instructions ---
+# To debug UberEats scraping with visible browser + tracing:
+# 1. Set in settings/config:
+#    ubereats_debug=true, ubereats_headless=false, ubereats_slow_mo_ms=250
+#    ubereats_trace=true, ubereats_screenshots=true
+# 2. Run: uvicorn main:app --reload
+# 3. POST /api/scrape/ubereats?mode=sync with:
+#    {"location":"21044","restaurants":["McDonald's"],"auto_rank":false}
+# 4. Check logs for [DEBUG] input values + first suggestion text
+# 5. Traces saved to backend/traces/ubereats-job-<job_id>-<ts>.zip
+# 6. Screenshots saved to backend/screenshots/ on failures
+
+
+@router.post("/scrape/ubereats", response_model=ScrapeJobResponse, status_code=202)
 async def import_ubereats_menus(
     payload: UberEatsImportRequest,
+    mode: str = Query(default="async", description="async (default) or sync"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Import store-specific pricing from Uber Eats.
-    We discover nearby stores for the supported chains using the provided location,
-    then scrape each store page for pricing.
+    Default: enqueue async job and return job id (202).
+    mode=sync: run inline, respecting per-store timeouts.
+
+    Examples:
+      curl -X POST http://localhost:8000/api/scrape/ubereats -H "Content-Type: application/json" -d '{"location":"21044","restaurants":["McDonald'\''s"],"auto_rank":false}'
+      curl http://localhost:8000/api/scrape/ubereats/jobs/<job_id>
+      curl -X POST "http://localhost:8000/api/scrape/ubereats?mode=sync" -H "Content-Type: application/json" -d '{"location":"21044"}'
     """
-    if not payload.location and not payload.store_urls:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either a location or explicit store URLs to import.",
-        )
-
-    created = 0
-    updated = 0
-    ranked = 0
-    skipped: List[dict] = []
-    stores_processed = []
-
-    restaurants_to_fetch = (
+    cache_key = None
+    cache_entry = None
+    restaurants_list = (
         payload.restaurants if payload.restaurants else SUPPORTED_UBER_EATS_RESTAURANTS
     )
-
-    store_targets: List[dict] = []
-
-    lat = lon = None
-    pl_param: Optional[str] = None
-
     if payload.location:
-        lat, lon = await ubereats_store_search.geocode_location(payload.location)
-        if lat is None or lon is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not geocode location '{payload.location}'. Please provide a more precise address or ZIP code.",
-            )
-        pl_param = _build_pl_payload(payload.location, lat, lon)
+        cache_key = _cache_key(payload.location, restaurants_list)
+        cached = UBEREATS_CACHE.get(cache_key)
+        if cached and cached.get("expires_at") and cached["expires_at"] > datetime.utcnow():
+            cache_entry = cached
 
-    # Add manually supplied store URLs (if any)
-    if payload.store_urls:
-        for idx, store_url in enumerate(payload.store_urls):
-            restaurant_name = (
-                restaurants_to_fetch[idx]
-                if idx < len(restaurants_to_fetch)
-                else "Uber Eats Store"
-            )
-            enriched_url = str(store_url)
-            if pl_param:
-                enriched_url = _with_query_params(enriched_url, diningMode="DELIVERY", pl=pl_param)
-            store_targets.append(
+    if cache_entry and mode != "sync":
+        # Return cached job status/result without starting new work
+        return ScrapeJobResponse(
+            job_id=cache_entry.get("job_id"),
+            status=cache_entry.get("status"),
+            progress=cache_entry.get("progress"),
+            result=cache_entry.get("result"),
+        )
+
+    job = ScrapeJob(status="queued", request_json=json.dumps(payload.model_dump()))
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    if cache_key:
+        UBEREATS_CACHE[cache_key] = {
+            "job_id": job.id,
+            "status": "queued",
+            "progress": None,
+            "result": None,
+            "expires_at": datetime.utcnow() + timedelta(seconds=settings.ubereats_cache_ttl_seconds),
+        }
+
+    if mode == "sync":
+        result = await _run_ubereats_job(job.id, payload)
+        response = ScrapeJobResponse(
+            job_id=job.id,
+            status=result.get("status"),
+            progress=result.get("progress"),
+            result=result.get("result"),
+        )
+        return response
+
+    asyncio.create_task(_run_ubereats_job(job.id, payload))
+    return ScrapeJobResponse(job_id=job.id, status="queued")
+
+
+@router.get("/scrape/ubereats/jobs/{job_id}", response_model=ScrapeJobResponse)
+async def get_ubereats_job(job_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ScrapeJob).where(ScrapeJob.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return ScrapeJobResponse(
+        job_id=job.id,
+        status=job.status,
+        progress=json.loads(job.progress_json) if job.progress_json else None,
+        result=json.loads(job.result_json) if job.result_json else None,
+    )
+
+
+async def _update_job(job_id: str, **fields):
+    async with async_session_maker() as session:
+        res = await session.execute(select(ScrapeJob).where(ScrapeJob.id == job_id))
+        job = res.scalar_one_or_none()
+        if not job:
+            return
+        for k, v in fields.items():
+            setattr(job, k, v)
+        await session.commit()
+
+
+async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
+    """
+    Run UberEats scraping job. Never raises HTTPException (runs in background).
+    Converts all errors to status="failed" in result.
+    """
+    started = datetime.utcnow()
+    progress = {"total_stores": 0, "completed": 0, "failed": 0, "stores": []}
+    result_payload = {"ranked_deals": [], "unranked_deals": [], "metadata": {}}
+    status = "running"
+    await _update_job(job_id, status="running", started_at=started)
+
+    try:
+        restaurants_to_fetch = (
+            payload.restaurants if payload.restaurants else SUPPORTED_UBER_EATS_RESTAURANTS
+        )
+        max_restaurants = settings.ubereats_max_restaurants or 8
+        if len(restaurants_to_fetch) > max_restaurants:
+            status = "failed"
+            progress["stores"].append(
                 {
-                    "restaurant": restaurant_name,
-                    "store_url": enriched_url,
-                    "store_external_id": _extract_store_id_from_url(enriched_url),
-                    "store_name": restaurant_name,
-                    "latitude": lat,
-                    "longitude": lon,
-                    "source": "manual",
+                    "status": "failed",
+                    "error": f"Too many restaurants ({len(restaurants_to_fetch)}). Max {max_restaurants}.",
                 }
             )
+            return {"status": status, "progress": progress, "result": result_payload}
 
-    # Auto-discover stores based on location
-    if payload.location:
-        for restaurant in restaurants_to_fetch:
-            try:
-                stores = await ubereats_store_search.search_stores(
-                    restaurant,
-                    payload.location,
-                    lat=lat,
-                    lon=lon,
+        store_targets: List[dict] = []
+
+        if payload.store_urls:
+            for idx, store_url in enumerate(payload.store_urls):
+                restaurant_name = (
+                    restaurants_to_fetch[idx]
+                    if idx < len(restaurants_to_fetch)
+                    else "Uber Eats Store"
                 )
-            except Exception as exc:
-                logger.error("Failed to search stores for %s: %s", restaurant, exc)
-                skipped.append(
+                store_url_str = str(store_url)
+                store_targets.append(
                     {
-                        "restaurant": restaurant,
-                        "reason": f"store search failed: {exc}",
+                        "restaurant": restaurant_name,
+                        "store_url": store_url_str,
+                        "store_external_id": _extract_store_id_from_url(store_url_str),
+                        "store_name": restaurant_name,
+                        "source": "manual",
                     }
                 )
-                continue
 
-            if not stores:
-                skipped.append(
-                    {
-                        "restaurant": restaurant,
-                        "reason": f"no stores found near {payload.location}",
-                    }
-                )
-                continue
+        if payload.location:
+            debug = settings.ubereats_debug
+            store_limit = max(1, settings.ubereats_store_limit)
 
-            store = stores[0]
-            store_url = store.store_url
-            if pl_param:
-                store_url = _with_query_params(store.store_url, diningMode="DELIVERY", pl=pl_param)
-            store_targets.append(
-                {
-                    "restaurant": restaurant,
-                    "store_url": store_url,
-                    "store_external_id": store.store_id,
-                    "store_name": store.name,
-                    "latitude": store.latitude or lat,
-                    "longitude": store.longitude or lon,
-                    "source": "auto",
-                }
-            )
-
-    if not store_targets:
-        raise HTTPException(
-            status_code=404,
-            detail="No Uber Eats stores found to import. Check the location and try again.",
-        )
-
-    seen_store_keys = set()
-
-    for target in store_targets:
-        store_url = target["store_url"]
-        restaurant_name = target["restaurant"]
-
-        try:
-            items = await ubereats_scraper.fetch_menu(
-                store_url,
-                restaurant_name=restaurant_name,
-                location=payload.location,
-            )
-        except Exception as exc:
-            logger.error("Failed to scrape Uber Eats store %s: %s", store_url, exc)
-            skipped.append(
-                {
-                    "restaurant": restaurant_name,
-                    "store_url": store_url,
-                    "reason": f"scrape failed: {exc}",
-                }
-            )
-            continue
-
-        if not items:
-            skipped.append(
-                {
-                    "restaurant": restaurant_name,
-                    "store_url": store_url,
-                    "reason": "no items found",
-                }
-            )
-            continue
-
-        target_store_id = target.get("store_external_id")
-        store_external_id = items[0].store_external_id or target_store_id or store_url
-        store_key = (restaurant_name.lower(), store_external_id)
-        if store_key in seen_store_keys:
-            logger.info(
-                "Skipping duplicate store import for %s (%s)", restaurant_name, store_external_id
-            )
-            continue
-        seen_store_keys.add(store_key)
-        stores_processed.append(
-            {
-                "restaurant": restaurant_name,
-                "store_external_id": store_external_id,
-                "store_url": store_url,
-                "source": target.get("source", "auto"),
-                "store_name": target.get("store_name"),
-                "location": payload.location,
-                "latitude": target.get("latitude"),
-                "longitude": target.get("longitude"),
-            }
-        )
-
-        existing_stmt = select(Deal).where(
-            (Deal.restaurant_name == restaurant_name)
-            & (Deal.store_external_id == store_external_id)
-        )
-        result = await db.execute(existing_stmt)
-        existing_deals = {deal.item_name.lower(): deal for deal in result.scalars().all()}
-
-        for item in items:
-            key = item.name.lower()
-            existing = existing_deals.get(key)
-            if existing is None:
-                deal = Deal(
-                    restaurant_name=restaurant_name,
-                    item_name=item.name,
-                    price=item.price,
-                    category=item.category,
-                    deal_type="Uber Eats Menu",
-                    source_price_vendor=item.source_price_vendor,
-                    store_external_id=item.store_external_id,
-                    price_retrieved_at=item.price_retrieved_at,
-                    location=item.location or payload.location,
-                    is_active=True,
-                )
-                db.add(deal)
-                existing_deals[key] = deal
-                existing = deal
-                created += 1
-            else:
-                changed = False
-                if existing.price != item.price:
-                    existing.price = item.price
-                    changed = True
-                if item.category and existing.category != item.category:
-                    existing.category = item.category
-                    changed = True
-                if existing.source_price_vendor != item.source_price_vendor:
-                    existing.source_price_vendor = item.source_price_vendor
-                    changed = True
-                if existing.store_external_id != (item.store_external_id or store_external_id):
-                    existing.store_external_id = item.store_external_id or store_external_id
-                    changed = True
-                if existing.price_retrieved_at != item.price_retrieved_at:
-                    existing.price_retrieved_at = item.price_retrieved_at
-                    changed = True
-                if (item.location or payload.location) and existing.location != (
-                    item.location or payload.location
-                ):
-                    existing.location = item.location or payload.location
-                    changed = True
-                if not existing.is_active:
-                    existing.is_active = True
-                    changed = True
-                if changed:
-                    updated += 1
-
-            if payload.auto_rank:
+            for restaurant in restaurants_to_fetch:
                 try:
-                    scores = await gemini_service.score_deal(
-                        item_name=existing.item_name,
-                        restaurant_name=existing.restaurant_name,
-                        price=existing.price,
-                        calories=existing.calories,
-                        protein_grams=existing.protein_grams,
-                        description=existing.description or "",
-                        portion_size=existing.portion_size or "",
-                        deal_type=existing.deal_type or "",
+                    stores = await ubereats_store_search.search_stores(
+                        restaurant_name=restaurant,
+                        location=payload.location,
+                        limit=store_limit,
+                        debug=debug,
+                        slow_mo_ms=settings.ubereats_slow_mo_ms,
+                        trace=settings.ubereats_trace,
+                        screenshots=settings.ubereats_screenshots,
                     )
-                    _apply_score_results(
-                        existing,
-                        scores,
-                        provided_calories=existing.calories,
-                        provided_protein=existing.protein_grams,
-                    )
-                    existing.source_price_vendor = item.source_price_vendor
-                    existing.store_external_id = item.store_external_id or store_external_id
-                    existing.price_retrieved_at = item.price_retrieved_at
-                    existing.location = item.location or payload.location
-                    ranked += 1
                 except Exception as exc:
-                    logger.error(
-                        "Failed to rank Uber Eats item %s: %s",
-                        existing.item_name,
-                        exc,
+                    logger.error("Store search failed for %s: %s", restaurant, exc)
+                    progress["failed"] += 1
+                    progress["stores"].append(
+                        {"restaurant": restaurant, "status": "failed", "error": str(exc)}
                     )
-                    skipped.append(
+                    continue
+
+                if not stores:
+                    progress["failed"] += 1
+                    progress["stores"].append(
                         {
-                            "restaurant": restaurant_name,
-                            "store_url": store_url,
-                            "item": item.name,
-                            "reason": f"rank failed: {exc}",
+                            "restaurant": restaurant,
+                            "status": "failed",
+                            "error": f"no stores found near {payload.location}",
                         }
                     )
+                    continue
 
-    await db.commit()
+                store = stores[0]
+                store_targets.append(
+                    {
+                        "restaurant": restaurant,
+                        "store_url": store.store_url,
+                        "store_external_id": store.store_id,
+                        "store_name": store.name,
+                        "source": "auto",
+                    }
+                )
 
-    return {
-        "created": created,
-        "updated": updated,
-        "ranked": ranked,
-        "skipped": skipped,
-        "stores_processed": stores_processed,
-    }
+        max_total_stores = settings.ubereats_max_total_stores or 10
+        if len(store_targets) > max_total_stores:
+            status = "failed"
+            progress["stores"].append(
+                {
+                    "status": "failed",
+                    "error": f"Too many stores ({len(store_targets)}). Max {max_total_stores}.",
+                }
+            )
+            return {"status": status, "progress": progress, "result": result_payload}
+
+        if not store_targets:
+            status = "failed"
+            progress["stores"].append(
+                {"status": "failed", "error": "No Uber Eats stores to scrape."}
+            )
+            return {"status": status, "progress": progress, "result": result_payload}
+
+        progress["total_stores"] = len(store_targets)
+        progress_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(STORE_CONCURRENCY)
+
+        async with ubereats_scraper.shared_context() as scrape_ctx:
+            # Start tracing at job level if enabled
+            trace_path = None
+            if settings.ubereats_trace:
+                import os
+                import time
+
+                os.makedirs("traces", exist_ok=True)
+                trace_path = os.path.join(
+                    "traces",
+                    f"ubereats-job-{job_id}-{time.strftime('%Y%m%d-%H%M%S')}.zip",
+                )
+                await scrape_ctx.tracing.start(screenshots=True, snapshots=True, sources=True)
+
+            async def process_target(target: dict):
+                async with sem:
+                    store_url = target["store_url"]
+                    restaurant_name = target["restaurant"]
+                    store_result = {"restaurant": restaurant_name, "store_url": store_url}
+                    try:
+                        items = await asyncio.wait_for(
+                            ubereats_scraper.fetch_menu(
+                                store_url,
+                                restaurant_name=restaurant_name,
+                                location=payload.location or "",
+                                shared_context=scrape_ctx,
+                            ),
+                            timeout=STORE_TIMEOUT,
+                        )
+                        async with async_session_maker() as session_local:
+                            ranked, unranked = await _persist_and_rank_items(
+                                session_local,
+                                items,
+                                restaurant_name,
+                                store_url,
+                                payload.location or "",
+                                auto_rank=payload.auto_rank,
+                            )
+                            await session_local.commit()
+                        result_payload["ranked_deals"].extend(ranked)
+                        result_payload["unranked_deals"].extend(unranked)
+                        store_result["status"] = "completed"
+                        store_result["items"] = len(items)
+                        async with progress_lock:
+                            progress["completed"] += 1
+                            progress["stores"].append(store_result)
+                    except asyncio.TimeoutError:
+                        logger.error("Timeout scraping %s", store_url)
+                        store_result["status"] = "failed"
+                        store_result["error"] = "timeout"
+                        async with progress_lock:
+                            progress["failed"] += 1
+                            progress["stores"].append(store_result)
+                    except Exception as exc:
+                        logger.error("Error scraping %s: %s", store_url, exc)
+                        store_result["status"] = "failed"
+                        store_result["error"] = str(exc)
+                        async with progress_lock:
+                            progress["failed"] += 1
+                            progress["stores"].append(store_result)
+                    await _update_job(job_id, progress_json=json.dumps(progress))
+
+            await asyncio.gather(*[process_target(t) for t in store_targets])
+
+            # Stop trace if running
+            if trace_path:
+                try:
+                    await scrape_ctx.tracing.stop(path=trace_path)
+                    logger.info("Trace saved to %s", trace_path)
+                except Exception:
+                    pass
+
+        status = (
+            "completed"
+            if progress["failed"] == 0
+            else ("partial" if progress["completed"] > 0 else "failed")
+        )
+        result_payload["metadata"] = {"stores_attempted": len(store_targets)}
+
+    except Exception as exc:
+        logger.exception("Fatal error in _run_ubereats_job: %s", exc)
+        status = "failed"
+        progress["stores"].append({"status": "failed", "error": str(exc)})
+
+    finally:
+        finished = datetime.utcnow()
+        await _update_job(
+            job_id,
+            status=status,
+            finished_at=finished,
+            progress_json=json.dumps(progress),
+            result_json=json.dumps(result_payload),
+        )
+        # update cache if applicable
+        restaurants_list = (
+            payload.restaurants if payload.restaurants else SUPPORTED_UBER_EATS_RESTAURANTS
+        )
+        if payload.location:
+            cache_key = _cache_key(payload.location, restaurants_list)
+            UBEREATS_CACHE[cache_key] = {
+                "job_id": job_id,
+                "status": status,
+                "progress": progress,
+                "result": result_payload,
+                "expires_at": datetime.utcnow() + timedelta(seconds=settings.ubereats_cache_ttl_seconds),
+            }
+
+    return {"status": status, "progress": progress, "result": result_payload}
+
+
+async def _persist_and_rank_items(
+    session: AsyncSession,
+    items,
+    restaurant_name: str,
+    store_url: str,
+    location: str,
+    auto_rank: bool,
+):
+    ranked: List[dict] = []
+    unranked: List[dict] = []
+
+    existing_stmt = select(Deal).where(
+        (Deal.restaurant_name == restaurant_name)
+        & (Deal.store_external_id == _extract_store_id_from_url(store_url))
+    )
+    existing_result = await session.execute(existing_stmt)
+    existing_map = {d.item_name.lower(): d for d in existing_result.scalars().all()}
+
+    for item in items:
+        if item.price is None or item.price <= 0:
+            unranked.append(
+                {
+                    "restaurant": restaurant_name,
+                    "item": item.name,
+                    "store_url": store_url,
+                    "reason": "invalid_price",
+                }
+            )
+            continue
+
+        category = classify_item_category(item.name)
+        if category in ("merch", "sauce", "drink"):
+            unranked.append(
+                {
+                    "restaurant": restaurant_name,
+                    "item": item.name,
+                    "store_url": store_url,
+                    "reason": category,
+                }
+            )
+            continue
+
+        calories = item.calories
+        protein = item.protein_grams
+
+        # Try nugget estimation if calories missing
+        if calories is None or calories <= 0:
+            est = estimate_nugget_nutrition(item.name)
+            if est:
+                calories = int(est["calories"])
+                protein = float(est["protein_grams"])
+            else:
+                est2 = estimate_nutrition_heuristic(item.name, category=item.category, description=item.category or "")
+                if est2 and est2.get("calories"):
+                    calories = est2["calories"]
+                    protein = est2.get("protein_grams")
+
+        # Decide whether to rank
+        scores = None
+
+        if calories and calories > 0:
+            scores = calculate_final_value_score(calories, protein or 0.0, item.price)
+            scores["calories"] = int(calories)
+            scores["protein_grams"] = float(protein or 0.0)
+        else:
+            unranked.append(
+                {
+                    "restaurant": restaurant_name,
+                    "item": item.name,
+                    "store_url": store_url,
+                    "reason": "missing_nutrition",
+                }
+            )
+            continue
+
+        key = item.name.lower()
+        deal = existing_map.get(key)
+        if deal is None:
+            deal = Deal(
+                restaurant_name=restaurant_name,
+                item_name=item.name,
+                price=item.price,
+                category=item.category,
+                deal_type="Uber Eats Menu",
+                calories=scores.get("calories") if scores and scores.get("calories") is not None else calories,
+                protein_grams=scores.get("protein_grams") if scores and scores.get("protein_grams") is not None else protein,
+                source_price_vendor=item.source_price_vendor,
+                store_external_id=item.store_external_id or _extract_store_id_from_url(store_url),
+                price_retrieved_at=item.price_retrieved_at,
+                location=location,
+                is_active=True,
+                value_score=scores.get("value_score", 0.0),
+                satiety_score=scores.get("satiety_score", 0.0),
+                price_per_calorie=scores.get("price_per_calorie", 0.0),
+            )
+            session.add(deal)
+            existing_map[key] = deal
+        else:
+            deal.price = item.price
+            deal.category = item.category
+            if scores and scores.get("calories") is not None:
+                deal.calories = scores["calories"]
+            elif calories:
+                deal.calories = calories
+            if scores and scores.get("protein_grams") is not None:
+                deal.protein_grams = scores["protein_grams"]
+            elif protein is not None:
+                deal.protein_grams = protein
+            deal.source_price_vendor = item.source_price_vendor
+            deal.store_external_id = item.store_external_id or _extract_store_id_from_url(store_url)
+            deal.price_retrieved_at = item.price_retrieved_at
+            deal.location = location
+            deal.is_active = True
+            deal.value_score = scores.get("value_score", deal.value_score or 0.0)
+            deal.satiety_score = scores.get("satiety_score", deal.satiety_score or 0.0)
+            deal.price_per_calorie = scores.get("price_per_calorie", deal.price_per_calorie or 0.0)
+
+        ranked.append(
+            {
+                "restaurant": restaurant_name,
+                "item": item.name,
+                "price": item.price,
+                "store_url": store_url,
+                "value_score": deal.value_score,
+            }
+        )
+    ranked = sorted(ranked, key=lambda x: x.get("value_score", 0), reverse=True)
+    return ranked, unranked
+
+
+@router.get("/locations/suggest", response_model=List[LocationSuggestionResponse])
+async def suggest_locations(query: str = Query(...)):
+    return []

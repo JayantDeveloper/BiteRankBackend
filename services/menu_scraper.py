@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 USER_AGENT = (
-    "DealScoutBot/0.1 (+https://dealscout.example; contact: support@dealscout.local)"
+    "BiteRankBot/1.0 (+https://biterank.example; contact: support@biterank.local)"
 )
 
 
@@ -45,6 +45,10 @@ class MenuScraper:
             "restaurant": "McDonald's",
             "url": "https://www.mcdonalds.com/us/en-us/full-menu.html",
         },
+        "kfc": {
+            "restaurant": "KFC",
+            "url": "https://www.kfc.com/menu",
+        },
         "taco-bell": {
             "restaurant": "Taco Bell",
             "url": "https://www.tacobell.com/food",
@@ -56,10 +60,6 @@ class MenuScraper:
         "burger-king": {
             "restaurant": "Burger King",
             "url": "https://www.bk.com/menu",
-        },
-        "chick-fil-a": {
-            "restaurant": "Chick-fil-A",
-            "url": "https://www.chick-fil-a.com/menu",
         },
         "subway": {
             "restaurant": "Subway",
@@ -354,4 +354,3 @@ class MenuScraper:
 
 # Singleton instance for reuse across API calls
 menu_scraper = MenuScraper()
-

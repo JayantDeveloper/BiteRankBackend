@@ -62,7 +62,11 @@ class RankingResponse(BaseModel):
 
 
 class UberEatsImportRequest(BaseModel):
-    location: str = Field(..., min_length=2, description="User-provided location (ZIP or city)")
+    location: Optional[str] = Field(
+        None,
+        min_length=2,
+        description="User-provided location (ZIP or city). Optional if store_urls are provided.",
+    )
     restaurants: Optional[List[str]] = Field(
         None,
         description="Optional list of restaurants to import. Defaults to supported chains.",
@@ -72,3 +76,19 @@ class UberEatsImportRequest(BaseModel):
         description="Optional list of explicit store URLs to import in addition to discovered stores.",
     )
     auto_rank: bool = True
+
+
+class LocationSuggestionResponse(BaseModel):
+    label: str
+    latitude: float
+    longitude: float
+
+
+class ScrapeJobResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: Optional[dict] = None
+    result: Optional[dict] = None
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat() if v else None}

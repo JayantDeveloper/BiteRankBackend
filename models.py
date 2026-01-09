@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text
 from sqlalchemy.sql import func
 from database import Base
 from datetime import datetime
+import uuid
 
 
 class Deal(Base):
@@ -38,3 +39,19 @@ class Deal(Base):
 
     def __repr__(self):
         return f"<Deal {self.restaurant_name} - {self.item_name} (${self.price})>"
+
+
+class ScrapeJob(Base):
+    __tablename__ = "scrape_jobs"
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    status = Column(String(20), nullable=False, default="queued")  # queued|running|partial|completed|failed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    request_json = Column(Text, nullable=True)
+    progress_json = Column(Text, nullable=True)
+    result_json = Column(Text, nullable=True)
+
+    def __repr__(self):
+        return f"<ScrapeJob {self.id} status={self.status}>"
