@@ -9,7 +9,7 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, desc, select, asc, case
+from sqlalchemy import and_, desc, select, asc, case, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import async_session_maker, get_db
@@ -777,6 +777,10 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
     await _update_job(job_id, status="running", started_at=started)
 
     try:
+        async with async_session_maker() as session:
+            await session.execute(delete(Deal))
+            await session.commit()
+
         restaurants_to_fetch = (
             payload.restaurants if payload.restaurants else SUPPORTED_UBER_EATS_RESTAURANTS
         )
