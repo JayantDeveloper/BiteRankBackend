@@ -6,10 +6,8 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 
-# Load .env file
 load_dotenv()
 
-# Get API key
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key or api_key == "your_gemini_api_key_here":
@@ -19,10 +17,8 @@ if not api_key or api_key == "your_gemini_api_key_here":
 
 print(f"✓ API Key found: {api_key[:20]}...")
 
-# Configure Gemini
 genai.configure(api_key=api_key)
 
-# Test API call
 try:
     model = genai.GenerativeModel('gemini-2.5-flash')
     response = model.generate_content("Say 'Hello, MenuRanker!' in one sentence.")

@@ -1,3 +1,5 @@
+"""FastAPI entrypoint for BiteRank backend."""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -17,10 +19,9 @@ from api.routes import (
 from database import init_db, async_session_maker
 from models import Deal, ScrapeJob
 from schemas import UberEatsImportRequest
-from services.gemini_service import gemini_service  # Force import to trigger logging
+from services.gemini_service import gemini_service
 from config import get_settings
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -32,7 +33,6 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle startup and shutdown events"""
-    # Startup
     logger.info("Starting MenuRanker API...")
     await init_db()
     logger.info("Database initialized")
@@ -53,7 +53,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
     logger.info("Shutting down MenuRanker API...")
     if daily_task:
         daily_task.cancel()
@@ -68,16 +67,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers
 app.include_router(router, prefix="/api")
 
 
@@ -121,7 +118,6 @@ async def run_daily_ubereats_import():
         logger.warning("Cron import skipped: no location configured.")
         return
 
-    # Clear previous Uber Eats menu deals
     async with async_session_maker() as session:
         await session.execute(delete(Deal).where(Deal.deal_type == "Uber Eats Menu"))
         await session.commit()

@@ -1,3 +1,5 @@
+"""Database setup for BiteRank."""
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import text
@@ -5,14 +7,12 @@ from config import get_settings
 
 settings = get_settings()
 
-# Create async engine
 engine = create_async_engine(
     settings.database_url,
     echo=True,
     future=True
 )
 
-# Create async session factory
 async_session_maker = async_sessionmaker(
     engine,
     class_=AsyncSession,
@@ -38,7 +38,7 @@ async def get_db():
             await session.close()
 
 def _ensure_optional_columns(sync_conn):
-    dialect = sync_conn.dialect.name  # "sqlite", "postgresql", etc.
+    dialect = sync_conn.dialect.name
     if dialect != "sqlite":
         return
     try:

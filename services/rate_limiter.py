@@ -1,4 +1,4 @@
-# services/rate_limiter.py
+"""Simple async rate limiter."""
 from __future__ import annotations
 
 import asyncio
@@ -58,15 +58,12 @@ class RateLimiter:
                 self._cleanup(now)
 
                 if len(self._requests) < self.max_requests:
-                    # Reserve slot immediately.
                     self._requests.append(now)
                     return
 
-                # Need to wait until the oldest request exits the window.
                 oldest = self._requests[0]
                 sleep_time = (oldest + self.time_window) - now
 
-                # Small jitter to reduce thundering herd.
                 if sleep_time < 0:
                     sleep_time = 0.0
                 sleep_time += 0.05
@@ -78,9 +75,7 @@ class RateLimiter:
                     sleep_time,
                 )
 
-            # IMPORTANT: sleep OUTSIDE the lock.
             await asyncio.sleep(sleep_time)
 
 
-# Global rate limiter instance (50 requests per minute to be safe)
 gemini_rate_limiter = RateLimiter(max_requests=50, time_window=60.0)

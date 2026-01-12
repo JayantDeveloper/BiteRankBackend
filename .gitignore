@@ -17,3 +17,6 @@ __pycache__/
 
 # dotenv
 .env
+
+backend/traces/
+backend/screenshots/

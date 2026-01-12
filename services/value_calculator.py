@@ -1,4 +1,4 @@
-# services/value_calculator.py
+"""Scoring utilities for BiteRank deals."""
 from __future__ import annotations
 
 import logging
@@ -7,9 +7,6 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Baseline values (keep these)
-# -----------------------------
 TYPICAL_MEAL_CALORIES = 800
 TYPICAL_MEAL_PROTEIN = 30
 TYPICAL_MEAL_PRICE = 9.0
@@ -28,7 +25,6 @@ SALAD_PROT = 25
 TACO_CAL = 250
 TACO_PROT = 12
 
-# Typical price-per-calorie (~0.01125)
 TYPICAL_PRICE_PER_CALORIE = TYPICAL_MEAL_PRICE / TYPICAL_MEAL_CALORIES
 
 MERCH_KEYWORDS = ("sock", "tote", "toy", "shirt", "gift", "merch", "hoodie", "cap")
@@ -187,7 +183,6 @@ def estimate_nutrition_heuristic(name: str, category: Optional[str] = None, desc
     n = (name or "").lower()
     cat = (category or "").lower()
     desc = (description or "").lower()
-    # Merch/sauce/drink handled upstream
     est = estimate_nugget_nutrition(name)
     if est:
         return est

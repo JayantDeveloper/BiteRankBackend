@@ -1,4 +1,4 @@
-# services/gemini_service.py
+"""Gemini nutrition estimation service."""
 import asyncio
 import json
 import logging
@@ -16,7 +16,6 @@ from services.value_calculator import calculate_final_value_score
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Configure Gemini (do NOT log the key)
 if not settings.gemini_api_key:
     logger.warning("⚠️ GEMINI_API_KEY is not set. Gemini nutrition estimation will fail.")
 else:
@@ -40,18 +39,15 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 
     cleaned = text.strip()
 
-    # Strip common markdown fences
     cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^```\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
 
-    # If cleaned is pure JSON, parse it
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Otherwise, try to find the first {...} blob
     m = _JSON_OBJ_RE.search(cleaned)
     if not m:
         raise json.JSONDecodeError("no JSON object found", cleaned, 0)
@@ -81,13 +77,11 @@ def _coerce_nonneg_float(value: Any) -> Optional[float]:
 
 class GeminiService:
     def __init__(self):
-        # Keep model configurable if you ever want to swap
         model_name = getattr(settings, "gemini_model", None) or "gemini-2.5-flash"
         self.model = genai.GenerativeModel(model_name)
         self._circuit_open_until: float = 0.0
         self._circuit_cooldown_seconds: int = getattr(settings, "gemini_circuit_cooldown_seconds", 60)
         self._cache_ttl_seconds: int = getattr(settings, "gemini_cache_ttl_seconds", 3600)
-        # key -> (expires_at, (calories, protein))
         self._nutrition_cache: Dict[Tuple[str, str], Tuple[float, Tuple[int, float]]] = {}
         self._lock = asyncio.Lock()
 
@@ -126,7 +120,6 @@ class GeminiService:
         """
         def _call() -> str:
             resp = self.model.generate_content(prompt)
-            # resp.text is usually present; guard anyway
             return (getattr(resp, "text", None) or "").strip()
 
         return await asyncio.to_thread(_call)
@@ -158,9 +151,7 @@ class GeminiService:
 
         logger.info("🤖 Scoring deal: %s | %s | $%.2f", restaurant_name, item_name, price)
 
-        # ---- Fast path: user/scraper provided calories ----
         if calories is not None and calories > 0:
-            # If protein missing, treat as 0 for scoring (but keep return consistent)
             protein_for_calc = protein_grams if protein_grams is not None else 0.0
 
             logger.info(
@@ -179,7 +170,6 @@ class GeminiService:
                 "protein_grams": float(protein_for_calc),
             }
 
-        # ---- Slow path: estimate using Gemini ----
         logger.warning("⚠️ Missing calories; estimating with Gemini for %s (%s)", item_name, restaurant_name)
 
         cached = await self._get_cached_nutrition(restaurant_name, item_name)
@@ -200,7 +190,6 @@ class GeminiService:
             )
             return None
 
-        # Respect rate limits
         await gemini_rate_limiter.acquire()
 
         prompt = f"""Estimate the nutritional content of this fast food item/deal.
@@ -234,13 +223,11 @@ Examples:
             est_calories = _coerce_positive_int(nutrition.get("calories"))
             est_protein = _coerce_nonneg_float(nutrition.get("protein"))
 
-            # If Gemini gives garbage, fall back to defaults
             if est_calories is None:
                 logger.error("❌ Gemini returned invalid calories. Raw=%s | text=%s", nutrition.get("calories"), response_text)
                 est_calories = 600
 
             if est_protein is None:
-                # protein can reasonably be 0, but if missing/invalid, use a conservative default
                 est_protein = 20.0
 
             logger.info("🍔 Estimated nutrition: %s cal, %sg protein", est_calories, est_protein)
@@ -275,9 +262,7 @@ Examples:
         except Exception as e:
             logger.error("❌ Error scoring deal with Gemini: %s", e, exc_info=True)
 
-        # No safe estimate available
         return None
 
 
-# Singleton instance
 gemini_service = GeminiService()

@@ -5,10 +5,8 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 
-# Load .env file
 load_dotenv()
 
-# Get API key
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
@@ -17,7 +15,6 @@ if not api_key:
 
 print(f"✓ API Key found: {api_key[:20]}...")
 
-# Configure Gemini
 genai.configure(api_key=api_key)
 
 print("\n📋 Available models:")
@@ -34,7 +31,6 @@ except Exception as e:
     print(f"❌ Error listing models: {e}")
     print("\nTrying alternative method...")
 
-    # Try with direct model names
     test_models = [
         'gemini-pro',
         'gemini-1.5-flash',

@@ -1,4 +1,4 @@
-# services/ubereats_store_search.py
+"""Uber Eats store search via Playwright."""
 from __future__ import annotations
 
 import asyncio
@@ -191,8 +191,6 @@ class UberEatsStoreSearch:
                     await browser.close()
 
 
-# --- MVP functions (copied "to a T") ---
-
 async def set_location(page: Page, delivery_address: str, debug: bool = False) -> None:
     """
     Opens Uber Eats and sets delivery address using the homepage typeahead.
@@ -227,14 +225,11 @@ async def set_location(page: Page, delivery_address: str, debug: bool = False) -
         suggestion_text = await options.first.inner_text()
         logger.info("[DEBUG] First location suggestion: %s", suggestion_text)
 
-    # Small stability delay so the list doesn't reshuffle mid-click
     await page.wait_for_timeout(250)
 
-    # Click first suggestion
     await options.first.click()
     logger.info("Location suggestion clicked; waiting for global search bar")
 
-    # Wait for the post-location global search bar
     await page.locator('[data-testid="search-input"]').wait_for(state="visible", timeout=30000)
 
 async def ensure_location(page: Page, delivery_address: str, debug: bool = False) -> None:
@@ -244,7 +239,7 @@ async def ensure_location(page: Page, delivery_address: str, debug: bool = False
     """
     try:
         await page.locator('[data-testid="search-input"]').wait_for(state="visible", timeout=3000)
-        return  # already on a page with search bar; location is set
+        return
     except Exception:
         pass
     await set_location(page, delivery_address, debug=debug)
@@ -264,7 +259,6 @@ async def search_store_urls(page: Page, restaurant_query: str, limit: int = 3, d
     await search.wait_for(state="visible", timeout=30000)
     await search.scroll_into_view_if_needed()
 
-    # Some layouts shift the bar; force focus/click to ensure typing works
     try:
         await search.click(force=True)
     except Exception:
@@ -273,7 +267,6 @@ async def search_store_urls(page: Page, restaurant_query: str, limit: int = 3, d
         except Exception:
             pass
 
-    # Clear then type
     await search.fill("")
     await search.type(restaurant_query, delay=40)  # slight human-ish typing helps
 
@@ -281,7 +274,6 @@ async def search_store_urls(page: Page, restaurant_query: str, limit: int = 3, d
         input_value = await search.input_value()
         logger.info("[DEBUG] Search input filled with: %s", input_value)
 
-    # Wait for suggestion menu + at least one option
     menu = page.locator("#search-suggestions-typeahead-menu")
     options = menu.locator('[role="option"]')
 
@@ -302,7 +294,6 @@ async def search_store_urls(page: Page, restaurant_query: str, limit: int = 3, d
         await page.wait_for_timeout(200)
         await options.first.click()
     except Exception:
-        # Retry once with a refocus/click if suggestions didn't appear
         try:
             await search.click(force=True)
             await search.fill("")
@@ -310,11 +301,9 @@ async def search_store_urls(page: Page, restaurant_query: str, limit: int = 3, d
             await options.first.wait_for(state="visible", timeout=8000)
             await options.first.click()
         except Exception:
-            # Fallback: if suggestions still don't appear, try Enter
             logger.warning("Restaurant suggestions did not appear, falling back to Enter")
             await search.press("Enter")
 
-    # Now wait for results
     store_links = page.locator('a[href*="/store/"]')
     await store_links.first.wait_for(state="visible", timeout=30000)
     try:
@@ -344,5 +333,4 @@ async def search_store_urls(page: Page, restaurant_query: str, limit: int = 3, d
     return urls
 
 
-# Singleton (same pattern as before)
 ubereats_store_search = UberEatsStoreSearch(max_concurrent=1)

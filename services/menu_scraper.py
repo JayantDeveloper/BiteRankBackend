@@ -1,3 +1,5 @@
+"""Static menu scraping utilities for supported restaurants."""
+
 import asyncio
 import json
 import logging
@@ -351,6 +353,4 @@ class MenuScraper:
             return False
         return True
 
-
-# Singleton instance for reuse across API calls
 menu_scraper = MenuScraper()

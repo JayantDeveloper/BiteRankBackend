@@ -1,3 +1,6 @@
+"""
+api/routes.py: FastAPI endpoints for deals and Uber Eats scraping.
+"""
 import asyncio
 import json
 import logging
@@ -142,6 +145,11 @@ def _cache_key(location: str, restaurants: List[str]) -> str:
     loc_norm = (location or "").strip().lower()
     rest_norm = "|".join(sorted(r.strip().lower() for r in (restaurants or [])))
     return f"{loc_norm}__{rest_norm}"
+
+def _normalize_item_name(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    return " ".join(name.strip().lower().split())
 
 
 @router.get("/deals", response_model=List[DealResponse])
@@ -533,7 +541,7 @@ async def import_scraped_menus(
         stmt = select(Deal).where(Deal.restaurant_name.in_(restaurant_names))
         result = await db.execute(stmt)
         for deal in result.scalars().all():
-            key = (deal.restaurant_name.lower(), deal.item_name.lower())
+            key = (deal.restaurant_name.lower(), _normalize_item_name(deal.item_name))
             existing_map[key] = deal
 
     created = 0
@@ -565,7 +573,7 @@ async def import_scraped_menus(
                 )
                 continue
 
-            key = (restaurant_name.lower(), name.lower())
+            key = (restaurant_name.lower(), _normalize_item_name(name))
             provided_calories = item.get("calories")
             provided_protein = item.get("protein_grams")
             category = item.get("category")
@@ -667,20 +675,6 @@ async def import_scraped_menus(
         "skipped": skipped,
         "total": created + updated,
     }
-
-
-# --- UberEats Debug/Test Instructions ---
-# To debug UberEats scraping with visible browser + tracing:
-# 1. Set in settings/config:
-#    ubereats_debug=true, ubereats_headless=false, ubereats_slow_mo_ms=250
-#    ubereats_trace=true, ubereats_screenshots=true
-# 2. Run: uvicorn main:app --reload
-# 3. POST /api/scrape/ubereats?mode=sync with:
-#    {"location":"21044","restaurants":["McDonald's"],"auto_rank":false}
-# 4. Check logs for [DEBUG] input values + first suggestion text
-# 5. Traces saved to backend/traces/ubereats-job-<job_id>-<ts>.zip
-# 6. Screenshots saved to backend/screenshots/ on failures
-
 
 @router.post("/scrape/ubereats", response_model=ScrapeJobResponse, status_code=202)
 async def import_ubereats_menus(
@@ -1010,7 +1004,7 @@ async def _persist_and_rank_items(
         & (Deal.store_external_id == _extract_store_id_from_url(store_url))
     )
     existing_result = await session.execute(existing_stmt)
-    existing_map = {d.item_name.lower(): d for d in existing_result.scalars().all()}
+    existing_map = {_normalize_item_name(d.item_name): d for d in existing_result.scalars().all()}
 
     for item in items:
         if item.price is None or item.price <= 0:
@@ -1069,7 +1063,7 @@ async def _persist_and_rank_items(
             )
             continue
 
-        key = item.name.lower()
+        key = _normalize_item_name(item.name)
         deal = existing_map.get(key)
         if deal is None:
             deal = Deal(
