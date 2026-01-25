@@ -19,7 +19,6 @@ from api.routes import (
 from database import init_db, async_session_maker
 from models import Deal, ScrapeJob
 from schemas import UberEatsImportRequest
-from services.gemini_service import gemini_service
 from config import get_settings
 
 logging.basicConfig(
@@ -36,7 +35,6 @@ async def lifespan(app: FastAPI):
     logger.info("Starting MenuRanker API...")
     await init_db()
     logger.info("Database initialized")
-    logger.info(f"Gemini service loaded: {gemini_service}")
 
     daily_task = None
     if settings.ubereats_cron_enabled and settings.ubereats_cron_location:

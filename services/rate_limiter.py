@@ -77,5 +77,3 @@ class RateLimiter:
 
             await asyncio.sleep(sleep_time)
 
-
-gemini_rate_limiter = RateLimiter(max_requests=50, time_window=60.0)

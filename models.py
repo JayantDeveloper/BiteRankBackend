@@ -18,7 +18,7 @@ class Deal(Base):
     category = Column(String(50), nullable=True)  # e.g., "Burger", "Chicken", "Tacos"
     deal_type = Column(String(50), nullable=True)  # e.g., "App Exclusive", "Regular Menu"
 
-    # Nutrition data (estimated by Gemini)
+    # Nutrition data (estimated by heuristics)
     calories = Column(Integer, nullable=True)  # Total calories
     protein_grams = Column(Float, nullable=True)  # Protein in grams
 
