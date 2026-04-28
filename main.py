@@ -7,6 +7,7 @@ import logging
 import asyncio
 import json
 import contextlib
+import os
 from datetime import datetime, timedelta, time
 
 from sqlalchemy import delete
@@ -65,9 +66,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+_cors_origins_raw = os.environ.get("ALLOWED_ORIGINS", "")
+_cors_origins = (
+    [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    if _cors_origins_raw.strip() and _cors_origins_raw.strip() != "*"
+    else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

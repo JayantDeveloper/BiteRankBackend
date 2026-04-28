@@ -4,11 +4,13 @@ api/routes.py: FastAPI endpoints for deals and Uber Eats scraping.
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import and_, desc, select, asc, case, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +39,14 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
+
+_SCRAPE_API_KEY = os.environ.get("SCRAPE_API_KEY", "")
+
+
+def _require_scrape_key(x_api_key: Optional[str] = Header(default=None)):
+    if _SCRAPE_API_KEY and x_api_key != _SCRAPE_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-API-Key")
+
 
 SUPPORTED_UBER_EATS_RESTAURANTS = [
     "McDonald's",
@@ -681,6 +691,7 @@ async def import_ubereats_menus(
     payload: UberEatsImportRequest,
     mode: str = Query(default="async", description="async (default) or sync"),
     db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(_require_scrape_key),
 ):
     """
     Default: enqueue async job and return job id (202).
@@ -1135,5 +1146,50 @@ async def _persist_and_rank_items(
 
 
 @router.get("/locations/suggest", response_model=List[LocationSuggestionResponse])
-async def suggest_locations(query: str = Query(...)):
-    return []
+async def suggest_locations(query: str = Query(..., min_length=2)):
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": query,
+        "format": "json",
+        "addressdetails": 1,
+        "limit": 6,
+        "countrycodes": "us",
+    }
+    headers = {"User-Agent": "BiteRank/1.0"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            results = resp.json()
+    except Exception as exc:
+        logger.warning("Nominatim suggest failed for %r: %s", query, exc)
+        return []
+
+    suggestions: List[LocationSuggestionResponse] = []
+    seen: set = set()
+    for r in results:
+        addr = r.get("address", {})
+        zip_code = addr.get("postcode")
+        city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county")
+        state = addr.get("state")
+        if zip_code:
+            label = zip_code
+        elif city and state:
+            label = f"{city}, {state}"
+        else:
+            label = r.get("display_name", "").split(",")[0].strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        try:
+            suggestions.append(
+                LocationSuggestionResponse(
+                    label=label,
+                    latitude=float(r["lat"]),
+                    longitude=float(r["lon"]),
+                )
+            )
+        except (KeyError, ValueError):
+            continue
+
+    return suggestions
