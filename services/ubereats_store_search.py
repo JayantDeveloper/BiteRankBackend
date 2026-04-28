@@ -190,6 +190,96 @@ class UberEatsStoreSearch:
                     await context.close()
                     await browser.close()
 
+    async def search_stores_bulk(
+        self,
+        restaurants: List[str],
+        location: str,
+        *,
+        limit: int = 1,
+        debug: bool = False,
+        slow_mo_ms: int = 0,
+        screenshots: bool = False,
+        progress_callback=None,
+    ) -> dict:
+        """
+        Opens ONE browser, sets location once, then searches for each restaurant in sequence.
+        Returns Dict[restaurant_name, List[UberEatsStore]].
+        On per-restaurant failure: logs and continues with empty list.
+        progress_callback(restaurant, stores) is awaited after each restaurant resolves.
+        """
+        from typing import Dict
+        results: Dict[str, List[UberEatsStore]] = {}
+
+        if not restaurants or not location:
+            return {r: [] for r in (restaurants or [])}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=(not debug),
+                slow_mo=(slow_mo_ms if debug else 0),
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            page = await context.new_page()
+            page.set_default_timeout(self.timeout_ms)
+
+            try:
+                await set_location(page, location, debug=debug)
+            except Exception as exc:
+                logger.error("Bulk location set failed for '%s': %s", location, exc)
+                if screenshots:
+                    os.makedirs("screenshots", exist_ok=True)
+                    try:
+                        await page.screenshot(
+                            path=os.path.join("screenshots", f"ubereats-bulk-location-fail-{_ts()}.png"),
+                            full_page=True,
+                        )
+                    except Exception:
+                        pass
+                await context.close()
+                await browser.close()
+                empty = {r: [] for r in restaurants}
+                if progress_callback:
+                    for r in restaurants:
+                        await progress_callback(r, [])
+                return empty
+
+            for restaurant in restaurants:
+                stores: List[UberEatsStore] = []
+                try:
+                    urls = await search_store_urls(page, restaurant, limit=limit, debug=debug)
+                    stores = [
+                        UberEatsStore(
+                            name=restaurant,
+                            store_url=u,
+                            store_id=_extract_store_id_from_url(u),
+                        )
+                        for u in urls
+                    ]
+                    logger.info(
+                        "search_stores_bulk: found %d store(s) for %s near %s",
+                        len(stores),
+                        restaurant,
+                        location,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "search_stores_bulk: search_store_urls failed for '%s': %s",
+                        restaurant,
+                        exc,
+                    )
+
+                results[restaurant] = stores
+                if progress_callback:
+                    await progress_callback(restaurant, stores)
+
+            await context.close()
+            await browser.close()
+
+        return results
+
 
 async def set_location(page: Page, delivery_address: str, debug: bool = False) -> None:
     """
@@ -230,7 +320,15 @@ async def set_location(page: Page, delivery_address: str, debug: bool = False) -
     await options.first.click()
     logger.info("Location suggestion clicked; waiting for global search bar")
 
-    await page.locator('[data-testid="search-input"]').wait_for(state="visible", timeout=30000)
+    try:
+        await page.locator('[data-testid="search-input"]').wait_for(state="visible", timeout=30000)
+    except Exception as exc:
+        logger.warning("Search bar not ready after location select; retrying on feed page: %s", exc)
+        try:
+            await page.goto(HOME_URL + "feed", wait_until="domcontentloaded")
+        except Exception:
+            await page.goto(HOME_URL, wait_until="domcontentloaded")
+        await page.locator('[data-testid="search-input"]').wait_for(state="visible", timeout=45000)
 
 async def ensure_location(page: Page, delivery_address: str, debug: bool = False) -> None:
     """

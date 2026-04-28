@@ -32,7 +32,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle startup and shutdown events"""
-    logger.info("Starting MenuRanker API...")
+    logger.info("Starting BiteRank API...")
     await init_db()
     logger.info("Database initialized")
 
@@ -47,11 +47,11 @@ async def lifespan(app: FastAPI):
     elif settings.ubereats_cron_enabled:
         logger.warning("Uber Eats daily import enabled but no location set; skipping scheduling.")
 
-    logger.info("MenuRanker API started successfully")
+    logger.info("BiteRank API started successfully")
 
     yield
 
-    logger.info("Shutting down MenuRanker API...")
+    logger.info("Shutting down BiteRank API...")
     if daily_task:
         daily_task.cancel()
         with contextlib.suppress(Exception):
@@ -59,8 +59,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="MenuRanker API",
-    description="API for ranking fast food deals by value using AI",
+    title="BiteRank API",
+    description="API for ranking fast food deals by value",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -79,7 +79,7 @@ app.include_router(router, prefix="/api")
 @app.get("/")
 async def root():
     return {
-        "message": "Welcome to MenuRanker API",
+        "message": "Welcome to BiteRank API",
         "docs": "/docs",
         "version": "1.0.0"
     }

@@ -3,7 +3,7 @@ from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    database_url: str = "sqlite+aiosqlite:///./menuranker.db"
+    database_url: str = "sqlite+aiosqlite:///./biterank.db"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 

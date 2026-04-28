@@ -771,15 +771,18 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
     Converts all errors to status="failed" in result.
     """
     started = datetime.utcnow()
-    progress = {"total_stores": 0, "completed": 0, "failed": 0, "stores": []}
+    progress = {"stage": "starting", "total_stores": 0, "completed": 0, "failed": 0, "stores": []}
     result_payload = {"ranked_deals": [], "unranked_deals": [], "metadata": {}}
     status = "running"
     await _update_job(job_id, status="running", started_at=started)
 
     try:
         async with async_session_maker() as session:
-            await session.execute(delete(Deal))
+            await session.execute(delete(Deal).where(Deal.deal_type == "Uber Eats Menu"))
             await session.commit()
+
+        progress["stage"] = "finding_stores"
+        await _update_job(job_id, progress_json=json.dumps(progress))
 
         restaurants_to_fetch = (
             payload.restaurants if payload.restaurants else SUPPORTED_UBER_EATS_RESTAURANTS
@@ -787,6 +790,7 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
         max_restaurants = settings.ubereats_max_restaurants or 8
         if len(restaurants_to_fetch) > max_restaurants:
             status = "failed"
+            progress["stage"] = "failed"
             progress["stores"].append(
                 {
                     "status": "failed",
@@ -818,27 +822,27 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
         if payload.location:
             debug = settings.ubereats_debug
             store_limit = max(1, settings.ubereats_store_limit)
+            total_restaurants = len(restaurants_to_fetch)
+            found_count = 0
 
-            for restaurant in restaurants_to_fetch:
-                try:
-                    stores = await ubereats_store_search.search_stores(
-                        restaurant_name=restaurant,
-                        location=payload.location,
-                        limit=store_limit,
-                        debug=debug,
-                        slow_mo_ms=settings.ubereats_slow_mo_ms,
-                        trace=settings.ubereats_trace,
-                        screenshots=settings.ubereats_screenshots,
-                    )
-                except Exception as exc:
-                    logger.error("Store search failed for %s: %s", restaurant, exc)
-                    progress["failed"] += 1
+            async def _on_store_found(restaurant: str, stores) -> None:
+                nonlocal found_count
+                found_count += 1
+                if stores:
+                    for store in stores:
+                        store_targets.append(
+                            {
+                                "restaurant": restaurant,
+                                "store_url": store.store_url,
+                                "store_external_id": store.store_id,
+                                "store_name": store.name,
+                                "source": "auto",
+                            }
+                        )
                     progress["stores"].append(
-                        {"restaurant": restaurant, "status": "failed", "error": str(exc)}
+                        {"restaurant": restaurant, "status": "found", "store_url": stores[0].store_url}
                     )
-                    continue
-
-                if not stores:
+                else:
                     progress["failed"] += 1
                     progress["stores"].append(
                         {
@@ -847,22 +851,25 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
                             "error": f"no stores found near {payload.location}",
                         }
                     )
-                    continue
+                # Update finding_stores sub-progress so frontend bar can advance
+                progress["finding_stores_done"] = found_count
+                progress["finding_stores_total"] = total_restaurants
+                await _update_job(job_id, progress_json=json.dumps(progress))
 
-                store = stores[0]
-                store_targets.append(
-                    {
-                        "restaurant": restaurant,
-                        "store_url": store.store_url,
-                        "store_external_id": store.store_id,
-                        "store_name": store.name,
-                        "source": "auto",
-                    }
-                )
+            await ubereats_store_search.search_stores_bulk(
+                restaurants=restaurants_to_fetch,
+                location=payload.location,
+                limit=store_limit,
+                debug=debug,
+                slow_mo_ms=settings.ubereats_slow_mo_ms,
+                screenshots=settings.ubereats_screenshots,
+                progress_callback=_on_store_found,
+            )
 
         max_total_stores = settings.ubereats_max_total_stores or 10
         if len(store_targets) > max_total_stores:
             status = "failed"
+            progress["stage"] = "failed"
             progress["stores"].append(
                 {
                     "status": "failed",
@@ -873,14 +880,18 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
 
         if not store_targets:
             status = "failed"
+            progress["stage"] = "failed"
             progress["stores"].append(
                 {"status": "failed", "error": "No Uber Eats stores to scrape."}
             )
             return {"status": status, "progress": progress, "result": result_payload}
 
+        progress["stage"] = "scraping_menus"
         progress["total_stores"] = len(store_targets)
+        progress["stores_found"] = len(store_targets)
         progress_lock = asyncio.Lock()
         sem = asyncio.Semaphore(STORE_CONCURRENCY)
+        await _update_job(job_id, progress_json=json.dumps(progress))
 
         async with ubereats_scraper.shared_context() as scrape_ctx:
             # Start tracing at job level if enabled
@@ -954,6 +965,7 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
                 except Exception:
                     pass
 
+        progress["stage"] = "finalizing"
         status = (
             "completed"
             if progress["failed"] == 0
