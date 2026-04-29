@@ -17,14 +17,22 @@ logger = logging.getLogger(__name__)
 HOME_URL = "https://www.ubereats.com/"
 
 # Reduce Chromium memory footprint for constrained environments (e.g. Render free tier).
+# NOTE: --single-process is intentionally excluded — it causes crashes under memory pressure.
 _CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--no-zygote",
-    "--single-process",
     "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--hide-scrollbars",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--safebrowsing-disable-auto-update",
 ]
 
 

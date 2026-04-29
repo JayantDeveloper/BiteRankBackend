@@ -20,14 +20,22 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 # Reduce Chromium memory footprint for constrained environments (e.g. Render free tier).
+# NOTE: --single-process is intentionally excluded — it causes crashes under memory pressure.
 _CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--no-zygote",
-    "--single-process",
     "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--hide-scrollbars",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--safebrowsing-disable-auto-update",
 ]
 settings = get_settings()
 
@@ -143,11 +151,28 @@ def _parse_protein_grams(text: str) -> Optional[float]:
     return None
 
 
+_JUNK_NAME_RE = re.compile(
+    r"^(?:"
+    r"\d+(?:\.\d+)?"           # bare number like "4.5" or "4"
+    r"|[★☆]+"                  # star symbols
+    r"|earliest arrival"       # delivery estimate UI text
+    r"|free delivery"
+    r"|order minimum"
+    r"|add to cart"
+    r"|add to bag"
+    r"|sold out"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
 def _is_valid_item_name(name: str) -> bool:
     if not name:
         return False
     stripped = name.strip()
-    if not (1 <= len(stripped) <= 120):
+    if not (3 <= len(stripped) <= 120):
+        return False
+    if _JUNK_NAME_RE.match(stripped):
         return False
     return bool(NAME_ALNUM_RE.search(stripped))
 
@@ -410,6 +435,118 @@ def _extract_embedded_state(html: str) -> Optional[Any]:
     return None
 
 
+_RQ_ITEM_RE = re.compile(
+    r'"uuid":"(?P<uuid>[^"]{10,})"'
+    r',"imageUrl":"[^"]*"'
+    r',"title":"(?P<title>[^"]+)"'
+    r',"price":(?P<price_cents>\d+)'
+    r',"priceTagline":\{"text":"(?P<tag>[^"]+)"'
+)
+_RQ_SECTION_RE = re.compile(
+    r'"catalogSectionUUID":"(?P<uuid>[^"]+)"'
+    r'.*?"standardItemsPayload":\{"title":\{"text":"(?P<name>[^"]+)"'
+)
+_RQ_CAL_RE = re.compile(r"(\d+)\s*[-–]\s*(\d+)\s*Cal|(\d+)\s*Cal", re.IGNORECASE)
+
+
+def _extract_items_from_react_query_state(
+    html: str,
+    *,
+    restaurant_name: str,
+    store_id: str,
+    retrieved_at: datetime,
+    location: Optional[str],
+) -> List["UberEatsMenuItem"]:
+    """
+    Primary extractor for modern Uber Eats pages.
+
+    Uber Eats migrated from window.__NEXT_DATA__ to __REACT_QUERY_STATE__.
+    The script tag contains double-escaped unicode (\\u0022 etc.) and an
+    embedded URL-encoded JSON field (metaJson) that breaks standard json.loads.
+    We extract the catalogSectionsMap via regex instead of parsing the whole blob.
+
+    Prices are stored in CENTS (integer) — divide by 100 for dollars.
+    Calories live in priceTagline.text: "$5.39 • 340 Cal." or "750 - 1050 Cal."
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    # Uber Eats uses different script IDs depending on the page variant/build.
+    tag = (
+        soup.find("script", id="__REACT_QUERY_STATE__")
+        or soup.find("script", id="__FUSION_PLUGIN_REACT_QUERY_STATE__")
+    )
+    if not tag or not tag.string:
+        return []
+
+    try:
+        decoded = tag.string.strip().encode("raw_unicode_escape").decode("unicode_escape")
+    except Exception:
+        return []
+
+    # Build subsection_uuid → section name map for category labels.
+    section_names: dict = {}
+    for m in _RQ_SECTION_RE.finditer(decoded):
+        section_names[m.group("uuid")] = m.group("name")
+
+    # Pull subsectionUuid per item (it follows shortly after the main item fields).
+    subsection_re = re.compile(r'"subsectionUuid":"([^"]+)"')
+
+    items: List[UberEatsMenuItem] = []
+    seen_uuids: set = set()
+
+    for m in _RQ_ITEM_RE.finditer(decoded):
+        uuid = m.group("uuid")
+        if uuid in seen_uuids:
+            continue
+        seen_uuids.add(uuid)
+
+        title = m.group("title").strip()
+        if not _is_valid_item_name(title):
+            continue
+
+        price_usd = int(m.group("price_cents")) / 100
+        if not (0.5 <= price_usd < 1000):
+            continue
+
+        tag_text = m.group("tag")
+        cal_m = _RQ_CAL_RE.search(tag_text)
+        if cal_m:
+            if cal_m.group(1) and cal_m.group(2):
+                calories: Optional[int] = (int(cal_m.group(1)) + int(cal_m.group(2))) // 2
+            else:
+                calories = int(cal_m.group(3))
+        else:
+            calories = None
+
+        # Find the nearest subsectionUuid after this item's position.
+        sub_m = subsection_re.search(decoded, m.end())
+        category = section_names.get(sub_m.group(1)) if sub_m else None
+
+        items.append(
+            UberEatsMenuItem(
+                restaurant=restaurant_name,
+                name=title,
+                price=price_usd,
+                category=category,
+                calories=calories,
+                protein_grams=None,
+                store_external_id=store_id,
+                price_retrieved_at=retrieved_at,
+                location=location,
+                source_price_vendor="ubereats",
+            )
+        )
+        if len(items) >= 500:
+            break
+
+    logger.info(
+        "🔍 ReactQueryState extractor: %d items from %d sections for %s",
+        len(items),
+        len(section_names),
+        store_id,
+    )
+    return items
+
+
 def parse_menu_from_html_fallback(html: str) -> List[Dict]:
     """
     Fallback HTML parse using rich-text spans:
@@ -642,22 +779,31 @@ class UberEatsScraper:
                         except Exception:
                             pass
 
-            embedded = _extract_embedded_state(html)
-            structured_items: List[UberEatsMenuItem] = []
-            if embedded is not None:
-                structured_items = _extract_items_from_embedded_json(
-                    embedded,
-                    restaurant_name=restaurant_name,
-                    store_id=store_id,
-                    retrieved_at=retrieved_at,
-                    location=location,
-                )
+            # Primary: __REACT_QUERY_STATE__ (modern Uber Eats, replaces __NEXT_DATA__)
+            rq_items = _extract_items_from_react_query_state(
+                html,
+                restaurant_name=restaurant_name,
+                store_id=store_id,
+                retrieved_at=retrieved_at,
+                location=location,
+            )
+            structured_items: List[UberEatsMenuItem] = rq_items
 
-            structured_items = [
-                it
-                for it in structured_items
-                if _is_valid_item_name(it.name) and 0 < it.price < 1000
-            ]
+            # Secondary: legacy __NEXT_DATA__ / __NUXT__ etc. (kept for compatibility)
+            if not structured_items:
+                embedded = _extract_embedded_state(html)
+                if embedded is not None:
+                    legacy_items = _extract_items_from_embedded_json(
+                        embedded,
+                        restaurant_name=restaurant_name,
+                        store_id=store_id,
+                        retrieved_at=retrieved_at,
+                        location=location,
+                    )
+                    structured_items = [
+                        it for it in legacy_items
+                        if _is_valid_item_name(it.name) and 0 < it.price < 1000
+                    ]
 
             fallback_items: List[UberEatsMenuItem] = []
             parsed = parse_menu_from_html_fallback(html)
@@ -709,7 +855,7 @@ class UberEatsScraper:
             final_items = list(deduped.values())
 
             logger.info(
-                "✅ UberEatsScraper: %d structured, %d fallback => %d final items for %s (%s)",
+                "✅ UberEatsScraper: %d rq/structured, %d html-fallback => %d final items for %s (%s)",
                 len(structured_items),
                 len(fallback_items),
                 len(final_items),
