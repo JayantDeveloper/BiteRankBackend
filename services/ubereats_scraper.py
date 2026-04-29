@@ -18,6 +18,17 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 from config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Reduce Chromium memory footprint for constrained environments (e.g. Render free tier).
+_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-zygote",
+    "--single-process",
+    "--disable-extensions",
+]
 settings = get_settings()
 
 USER_AGENT = (
@@ -524,7 +535,7 @@ class UberEatsScraper:
         async with async_playwright() as p:
             headless = False if self.debug else self.headless
             slow_mo = self.slow_mo_ms if self.debug else 0
-            browser = await p.chromium.launch(headless=headless, slow_mo=slow_mo)
+            browser = await p.chromium.launch(headless=headless, slow_mo=slow_mo, args=_CHROMIUM_ARGS)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 locale="en-US",
@@ -564,7 +575,7 @@ class UberEatsScraper:
                     headless = False if self.debug else self.headless
                     slow_mo = self.slow_mo_ms if self.debug else 0
                     browser = await playwright_instance.chromium.launch(
-                        headless=headless, slow_mo=slow_mo
+                        headless=headless, slow_mo=slow_mo, args=_CHROMIUM_ARGS
                     )
                     context = await browser.new_context(
                         viewport={"width": 1280, "height": 800},

@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 
 HOME_URL = "https://www.ubereats.com/"
 
+# Reduce Chromium memory footprint for constrained environments (e.g. Render free tier).
+_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-zygote",
+    "--single-process",
+    "--disable-extensions",
+]
+
 
 @dataclass
 class UberEatsStore:
@@ -68,6 +79,7 @@ class UberEatsStoreSearch:
             browser = await p.chromium.launch(
                 headless=(not debug),
                 slow_mo=(slow_mo_ms if debug else 0),
+                args=_CHROMIUM_ARGS,
             )
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
@@ -124,6 +136,7 @@ class UberEatsStoreSearch:
                 browser = await p.chromium.launch(
                     headless=(not debug),
                     slow_mo=(slow_mo_ms if debug else 0),
+                    args=_CHROMIUM_ARGS,
                 )
                 context = await browser.new_context(
                     viewport={"width": 1280, "height": 800},
@@ -217,6 +230,7 @@ class UberEatsStoreSearch:
             browser = await p.chromium.launch(
                 headless=(not debug),
                 slow_mo=(slow_mo_ms if debug else 0),
+                args=_CHROMIUM_ARGS,
             )
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
