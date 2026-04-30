@@ -11,6 +11,9 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright_stealth import Stealth
+
+_stealth = Stealth()
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +164,7 @@ class UberEatsStoreSearch:
                     await context.tracing.start(screenshots=True, snapshots=True, sources=True)
 
                 page = await context.new_page()
+                await _stealth.apply_stealth_async(page)
 
                 try:
                     await set_location(page, location, debug=debug)
@@ -245,12 +249,13 @@ class UberEatsStoreSearch:
                 locale="en-US",
             )
             page = await context.new_page()
+            await _stealth.apply_stealth_async(page)
             page.set_default_timeout(self.timeout_ms)
 
             try:
                 await set_location(page, location, debug=debug)
             except Exception as exc:
-                logger.error("Bulk location set failed for '%s': %s", location, exc)
+                logger.exception("Bulk location set FAILED for '%s': %s", location, exc)
                 if screenshots:
                     os.makedirs("screenshots", exist_ok=True)
                     try:
@@ -265,7 +270,7 @@ class UberEatsStoreSearch:
                 empty = {r: [] for r in restaurants}
                 if progress_callback:
                     for r in restaurants:
-                        await progress_callback(r, [])
+                        await progress_callback(r, [], error=str(exc))
                 return empty
 
             for restaurant in restaurants:
@@ -287,11 +292,15 @@ class UberEatsStoreSearch:
                         location,
                     )
                 except Exception as exc:
-                    logger.error(
-                        "search_stores_bulk: search_store_urls failed for '%s': %s",
+                    logger.exception(
+                        "search_stores_bulk: search_store_urls FAILED for '%s': %s",
                         restaurant,
                         exc,
                     )
+                    results[restaurant] = stores
+                    if progress_callback:
+                        await progress_callback(restaurant, stores, error=f"{type(exc).__name__}: {exc}")
+                    continue
 
                 results[restaurant] = stores
                 if progress_callback:

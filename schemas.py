@@ -89,6 +89,7 @@ class ScrapeJobResponse(BaseModel):
     status: str
     progress: Optional[dict] = None
     result: Optional[dict] = None
+    error: Optional[str] = None
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat() if v else None}

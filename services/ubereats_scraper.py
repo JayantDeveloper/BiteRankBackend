@@ -14,6 +14,9 @@ from contextlib import asynccontextmanager
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright_stealth import Stealth
+
+_stealth = Stealth()
 
 from config import get_settings
 
@@ -678,6 +681,7 @@ class UberEatsScraper:
                 locale="en-US",
                 user_agent=USER_AGENT,
             )
+            await _stealth.apply_stealth_async(context)
             try:
                 yield context
             finally:
@@ -722,6 +726,7 @@ class UberEatsScraper:
                     local_context = True
 
                 page = await context.new_page()
+                await _stealth.apply_stealth_async(page)
                 page.set_default_timeout(min(self.timeout_ms, 60000))
                 page.set_default_navigation_timeout(min(self.timeout_ms, 60000))
 

@@ -757,11 +757,20 @@ async def get_ubereats_job(job_id: str, db: AsyncSession = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    progress_data = json.loads(job.progress_json) if job.progress_json else None
+    # Surface the first store-level error as a top-level field so clients can read it directly
+    top_error = None
+    if job.status == "failed" and progress_data:
+        failed_stores = [s for s in (progress_data.get("stores") or []) if s.get("status") == "failed" and s.get("error")]
+        if failed_stores:
+            top_error = failed_stores[0]["error"]
+
     return ScrapeJobResponse(
         job_id=job.id,
         status=job.status,
-        progress=json.loads(job.progress_json) if job.progress_json else None,
+        progress=progress_data,
         result=json.loads(job.result_json) if job.result_json else None,
+        error=top_error,
     )
 
 
@@ -836,7 +845,7 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
             total_restaurants = len(restaurants_to_fetch)
             found_count = 0
 
-            async def _on_store_found(restaurant: str, stores) -> None:
+            async def _on_store_found(restaurant: str, stores, *, error: str = None) -> None:
                 nonlocal found_count
                 found_count += 1
                 if stores:
@@ -855,11 +864,12 @@ async def _run_ubereats_job(job_id: str, payload: UberEatsImportRequest):
                     )
                 else:
                     progress["failed"] += 1
+                    err_msg = error or f"no stores found near {payload.location}"
                     progress["stores"].append(
                         {
                             "restaurant": restaurant,
                             "status": "failed",
-                            "error": f"no stores found near {payload.location}",
+                            "error": err_msg,
                         }
                     )
                 # Update finding_stores sub-progress so frontend bar can advance

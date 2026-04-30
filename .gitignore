@@ -25,3 +25,9 @@ traces/
 screenshots/
 *.db
 *.sqlite
+.env.local
+.env
+*.db
+__pycache__/
+traces/
+screenshots/
