@@ -11,3 +11,4 @@ python-multipart==0.0.6
 greenlet==3.0.3
 beautifulsoup4==4.12.3
 playwright
+playwright-stealth
