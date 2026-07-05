@@ -1,5 +1,6 @@
 """Database setup for BiteRank."""
 
+import ssl
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -23,7 +24,14 @@ def _normalize_database_url(url: str) -> tuple[str, dict]:
         parsed = urlsplit(url)
         query = dict(parse_qsl(parsed.query))
         sslmode = query.pop("sslmode", None)
-        if sslmode in ("require", "verify-ca", "verify-full"):
+        if sslmode == "require":
+            # libpq's "require" means encrypt but don't verify the cert —
+            # needed for poolers with provider-CA certs (e.g. Supabase).
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            connect_args["ssl"] = ctx
+        elif sslmode in ("verify-ca", "verify-full"):
             connect_args["ssl"] = True
         url = urlunsplit(parsed._replace(query=urlencode(query)))
     return url, connect_args
