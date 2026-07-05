@@ -37,11 +37,12 @@ async def suggest_locations(query: str = Query(..., min_length=2)):
         addr = r.get("address", {})
         zip_code = addr.get("postcode")
         city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county")
-        state = addr.get("state")
-        if zip_code:
-            label = zip_code
-        elif city and state:
+        # "ISO3166-2-lvl4" is "US-MD" — prefer the 2-letter code over "Maryland"
+        state = (addr.get("ISO3166-2-lvl4") or "").split("-")[-1] or addr.get("state")
+        if city and state:
             label = f"{city}, {state}"
+        elif zip_code:
+            label = zip_code
         else:
             label = r.get("display_name", "").split(",")[0].strip()
         if not label or label in seen:
