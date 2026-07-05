@@ -157,13 +157,11 @@ async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
                 "metadata": {"cache_hit": True, "fresh_count": fresh_count},
             }
             cache_progress = {"stage": "cache_hit", "cached": True, "fresh_deals": fresh_count}
-            await _update_job(
-                job_id,
-                status="completed",
-                finished_at=utcnow(),
-                progress_json=json.dumps(cache_progress),
-                result_json=json.dumps(cache_result),
-            )
+            # Update the locals too — the finally block re-persists them, and
+            # would otherwise clobber the job back to "running" forever.
+            status = "completed"
+            progress = cache_progress
+            result_payload = cache_result
             return {"status": "completed", "progress": cache_progress, "result": cache_result}
 
         # Snapshot current deals before we touch DB — restore if scrape yields nothing
