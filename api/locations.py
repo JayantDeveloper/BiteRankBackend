@@ -36,7 +36,14 @@ async def suggest_locations(query: str = Query(..., min_length=2)):
     for r in results:
         addr = r.get("address", {})
         zip_code = addr.get("postcode")
-        city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county")
+        # For place matches, the feature's own name (e.g. hamlet "Clarksville")
+        # beats the postal city Nominatim attaches (e.g. "Columbia").
+        place_name = r.get("name") if r.get("class") == "place" and r.get("type") != "postcode" else None
+        city = (
+            place_name
+            or addr.get("city") or addr.get("town") or addr.get("village")
+            or addr.get("hamlet") or addr.get("suburb") or addr.get("county")
+        )
         # "ISO3166-2-lvl4" is "US-MD" — prefer the 2-letter code over "Maryland"
         state = (addr.get("ISO3166-2-lvl4") or "").split("-")[-1] or addr.get("state")
         if city and state:
