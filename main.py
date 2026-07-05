@@ -7,7 +7,9 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
+
+from timeutil import utcnow
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +25,12 @@ from config import get_settings
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+if not os.environ.get("JWT_SECRET"):
+    raise RuntimeError(
+        "JWT_SECRET environment variable is not set. "
+        'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
+    )
 
 
 @asynccontextmanager
@@ -48,7 +56,7 @@ async def lifespan(app: FastAPI):
 
 async def _recover_stuck_jobs() -> None:
     """Mark jobs that have been running for >10 minutes as failed."""
-    cutoff = datetime.utcnow() - timedelta(minutes=10)
+    cutoff = utcnow() - timedelta(minutes=10)
     async with async_session_maker() as session:
         result = await session.execute(
             select(ScrapeJob).where(ScrapeJob.status == "running", ScrapeJob.started_at < cutoff)
@@ -56,7 +64,7 @@ async def _recover_stuck_jobs() -> None:
         stuck = result.scalars().all()
         for job in stuck:
             job.status = "failed"
-            job.finished_at = datetime.utcnow()
+            job.finished_at = utcnow()
             job.progress_json = json.dumps({"stage": "failed", "error": "Job timed out (server restart)"})
         if stuck:
             await session.commit()
@@ -104,7 +112,7 @@ async def _seed_if_empty() -> None:
                 value_score=scores["value_score"],
                 satiety_score=scores["satiety_score"],
                 price_per_calorie=scores["price_per_calorie"],
-                last_ranked_at=datetime.utcnow(),
+                last_ranked_at=utcnow(),
             )
             session.add(deal)
             inserted += 1
@@ -115,8 +123,8 @@ async def _seed_if_empty() -> None:
 
 async def _schedule_daily_import() -> None:
     while True:
-        now = datetime.utcnow()
-        target = datetime.combine(now.date(), time(hour=settings.ubereats_cron_hour_utc))
+        now = utcnow()
+        target = datetime.combine(now.date(), time(hour=settings.ubereats_cron_hour_utc), tzinfo=timezone.utc)
         if target <= now:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())

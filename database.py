@@ -1,5 +1,7 @@
 """Database setup for BiteRank."""
 
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import text
@@ -7,10 +9,34 @@ from config import get_settings
 
 settings = get_settings()
 
+
+def _normalize_database_url(url: str) -> tuple[str, dict]:
+    """Render/Heroku hand out postgres:// or postgresql:// URLs. SQLAlchemy async
+    needs the asyncpg driver, and asyncpg takes ssl via connect_args rather than
+    a ?sslmode= query param (which it rejects)."""
+    connect_args: dict = {}
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    if url.startswith("postgresql+asyncpg://"):
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query))
+        sslmode = query.pop("sslmode", None)
+        if sslmode in ("require", "verify-ca", "verify-full"):
+            connect_args["ssl"] = True
+        url = urlunsplit(parsed._replace(query=urlencode(query)))
+    return url, connect_args
+
+
+_db_url, _connect_args = _normalize_database_url(settings.database_url)
+
 engine = create_async_engine(
-    settings.database_url,
-    echo=True,
-    future=True
+    _db_url,
+    echo=settings.database_echo,
+    future=True,
+    pool_pre_ping=True,
+    connect_args=_connect_args,
 )
 
 async_session_maker = async_sessionmaker(

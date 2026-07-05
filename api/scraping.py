@@ -1,12 +1,12 @@
-"""Uber Eats scraping endpoints and job orchestration."""
+"""Uber Eats scraping endpoints and job orchestration (Firecrawl-backed)."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import timedelta
+from typing import List, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,14 +17,14 @@ from config import get_settings
 from database import async_session_maker, get_db
 from models import Deal, ScrapeJob
 from schemas import ScrapeJobResponse, UberEatsImportRequest
-from services.ubereats_scraper import ubereats_scraper
-from services.ubereats_store_search import ubereats_store_search
+from services.ubereats_firecrawl import ubereats_firecrawl
 from services.value_calculator import (
     calculate_final_value_score,
     classify_item_category,
     estimate_nugget_nutrition,
     estimate_nutrition_heuristic,
 )
+from timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -41,10 +41,6 @@ SUPPORTED_RESTAURANTS = [
     "Popeyes",
 ]
 
-STORE_TIMEOUT = 120
-STORE_CONCURRENCY = 3
-UBEREATS_CACHE: Dict[str, dict] = {}
-
 _SCRAPE_API_KEY = os.environ.get("SCRAPE_API_KEY", "")
 
 
@@ -52,12 +48,6 @@ def _require_scrape_key(x_api_key: Optional[str] = None):
     from fastapi import Header
     if _SCRAPE_API_KEY and x_api_key != _SCRAPE_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing X-API-Key")
-
-
-def _cache_key(location: str, restaurants: List[str]) -> str:
-    loc = (location or "").strip().lower()
-    rest = "|".join(sorted(r.strip().lower() for r in (restaurants or [])))
-    return f"{loc}__{rest}"
 
 
 def _store_id_from_url(url: str) -> str:
@@ -93,22 +83,10 @@ async def import_ubereats_menus(
     mode: str = Query(default="async"),
     db: AsyncSession = Depends(get_db),
 ):
-    restaurants_list = payload.restaurants or SUPPORTED_RESTAURANTS
-
-    if payload.location:
-        key = _cache_key(payload.location, restaurants_list)
-        cached = UBEREATS_CACHE.get(key)
-        if cached and cached.get("expires_at") and cached["expires_at"] > datetime.utcnow() and mode != "sync":
-            return ScrapeJobResponse(job_id=cached["job_id"], status=cached["status"], progress=cached["progress"], result=cached["result"])
-
     job = ScrapeJob(status="queued", request_json=json.dumps(payload.model_dump()))
     db.add(job)
     await db.commit()
     await db.refresh(job)
-
-    if payload.location:
-        key = _cache_key(payload.location, restaurants_list)
-        UBEREATS_CACHE[key] = {"job_id": job.id, "status": "queued", "progress": None, "result": None, "expires_at": datetime.utcnow() + timedelta(seconds=settings.ubereats_cache_ttl_seconds)}
 
     if mode == "sync":
         result = await run_ubereats_job(job.id, payload)
@@ -143,24 +121,27 @@ async def get_ubereats_job(job_id: str, db: AsyncSession = Depends(get_db)):
 
 async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
     """Orchestrate a full Uber Eats scrape job. Never raises — errors become status=failed."""
-    started = datetime.utcnow()
+    started = utcnow()
     progress = {"stage": "starting", "total_stores": 0, "completed": 0, "failed": 0, "stores": []}
     result_payload: dict = {"ranked_deals": [], "unranked_deals": [], "metadata": {}}
     status = "running"
     await _update_job(job_id, status="running", started_at=started)
 
     try:
-        restaurants_to_fetch = payload.restaurants or SUPPORTED_RESTAURANTS
+        restaurants_to_fetch = (payload.restaurants or SUPPORTED_RESTAURANTS)[: settings.ubereats_max_restaurants]
 
-        # DB-level persistent cache: skip Playwright if fresh scraped deals already exist
+        # Persistent DB cache: skip scraping if fresh deals already exist for this location
         async with async_session_maker() as check_session:
-            cutoff = datetime.utcnow() - timedelta(seconds=settings.ubereats_cache_ttl_seconds)
+            cutoff = utcnow() - timedelta(seconds=settings.ubereats_cache_ttl_seconds)
+            freshness_filters = [
+                Deal.is_active == True,
+                Deal.deal_type == "Uber Eats Menu",
+                Deal.created_at > cutoff,
+            ]
+            if payload.location:
+                freshness_filters.append(Deal.location == payload.location)
             fresh_count_result = await check_session.execute(
-                select(func.count(Deal.id)).where(
-                    Deal.is_active == True,
-                    Deal.deal_type == "Uber Eats Menu",
-                    Deal.created_at > cutoff,
-                )
+                select(func.count(Deal.id)).where(*freshness_filters)
             )
             fresh_count = fresh_count_result.scalar() or 0
 
@@ -179,7 +160,7 @@ async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
             await _update_job(
                 job_id,
                 status="completed",
-                finished_at=datetime.utcnow(),
+                finished_at=utcnow(),
                 progress_json=json.dumps(cache_progress),
                 result_json=json.dumps(cache_result),
             )
@@ -213,35 +194,41 @@ async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
                 url_str = str(store_url)
                 store_targets.append({"restaurant": restaurant_name, "store_url": url_str, "store_external_id": _store_id_from_url(url_str), "source": "manual"})
 
-        # Playwright-based store discovery
+        # Firecrawl-based store discovery
         if payload.location:
             total_restaurants = len(restaurants_to_fetch)
+            progress["finding_stores_total"] = total_restaurants
             found_count = 0
+            progress_lock = asyncio.Lock()
+            search_sem = asyncio.Semaphore(settings.firecrawl_concurrency)
 
-            async def _on_store_found(restaurant: str, stores, *, error: str = None) -> None:
+            async def find_stores(restaurant: str) -> None:
                 nonlocal found_count
-                found_count += 1
-                if stores:
-                    for store in stores:
-                        store_targets.append({"restaurant": restaurant, "store_url": store.store_url, "store_external_id": store.store_id, "source": "auto"})
-                    progress["stores"].append({"restaurant": restaurant, "status": "found", "store_url": stores[0].store_url})
-                else:
-                    progress["failed"] += 1
-                    err_msg = error or f"no stores found near {payload.location}"
-                    progress["stores"].append({"restaurant": restaurant, "status": "not_found", "error": err_msg})
-                progress["finding_stores_done"] = found_count
-                progress["finding_stores_total"] = total_restaurants
+                stores, error = [], None
+                try:
+                    async with search_sem:
+                        stores = await ubereats_firecrawl.search_stores(
+                            restaurant, payload.location, limit=max(1, settings.ubereats_store_limit)
+                        )
+                except Exception as exc:
+                    logger.exception("Store search failed for %s: %s", restaurant, exc)
+                    error = str(exc)
+                async with progress_lock:
+                    found_count += 1
+                    if stores:
+                        for store in stores:
+                            store_targets.append({"restaurant": restaurant, "store_url": store.store_url, "store_external_id": store.store_id, "source": "auto"})
+                        progress["stores"].append({"restaurant": restaurant, "status": "found", "store_url": stores[0].store_url})
+                    else:
+                        progress["failed"] += 1
+                        err_msg = error or f"no stores found near {payload.location}"
+                        progress["stores"].append({"restaurant": restaurant, "status": "not_found", "error": err_msg})
+                    progress["finding_stores_done"] = found_count
                 await _update_job(job_id, progress_json=json.dumps(progress))
 
-            await ubereats_store_search.search_stores_bulk(
-                restaurants=restaurants_to_fetch,
-                location=payload.location,
-                limit=max(1, settings.ubereats_store_limit),
-                debug=settings.ubereats_debug,
-                slow_mo_ms=settings.ubereats_slow_mo_ms,
-                screenshots=settings.ubereats_screenshots,
-                progress_callback=_on_store_found,
-            )
+            await asyncio.gather(*[find_stores(r) for r in restaurants_to_fetch])
+
+        store_targets = store_targets[: settings.ubereats_max_total_stores]
 
         if not store_targets:
             logger.warning("No store targets found — preserving existing deals")
@@ -253,48 +240,51 @@ async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
 
         progress["stage"] = "scraping_menus"
         progress["total_stores"] = len(store_targets)
+        # Reset per-stage counters: 'failed' so far counted store-discovery misses
+        discovery_failures = progress["failed"]
+        progress["failed"] = 0
         await _update_job(job_id, progress_json=json.dumps(progress))
 
         progress_lock = asyncio.Lock()
-        sem = asyncio.Semaphore(STORE_CONCURRENCY)
+        sem = asyncio.Semaphore(settings.firecrawl_concurrency)
+        store_timeout = settings.firecrawl_timeout_seconds + 45
 
-        async with ubereats_scraper.shared_context() as scrape_ctx:
-            async def process_target(target: dict) -> None:
-                async with sem:
-                    store_url = target["store_url"]
-                    restaurant_name = target["restaurant"]
-                    store_result = {"restaurant": restaurant_name, "store_url": store_url}
-                    try:
-                        items = await asyncio.wait_for(
-                            ubereats_scraper.fetch_menu(store_url, restaurant_name=restaurant_name, location=payload.location or "", shared_context=scrape_ctx),
-                            timeout=STORE_TIMEOUT,
-                        )
-                        async with async_session_maker() as sess:
-                            ranked, unranked = await _persist_items(sess, items, restaurant_name, store_url, payload.location or "", auto_rank=payload.auto_rank)
-                            await sess.commit()
-                        result_payload["ranked_deals"].extend(ranked)
-                        result_payload["unranked_deals"].extend(unranked)
-                        store_result["status"] = "completed"
-                        store_result["items"] = len(items)
-                        async with progress_lock:
-                            progress["completed"] += 1
-                            progress["stores"].append(store_result)
-                    except asyncio.TimeoutError:
-                        store_result["status"] = "failed"
-                        store_result["error"] = "timeout"
-                        async with progress_lock:
-                            progress["failed"] += 1
-                            progress["stores"].append(store_result)
-                    except Exception as exc:
-                        logger.exception("Error scraping %s: %s", store_url, exc)
-                        store_result["status"] = "failed"
-                        store_result["error"] = str(exc)
-                        async with progress_lock:
-                            progress["failed"] += 1
-                            progress["stores"].append(store_result)
-                    await _update_job(job_id, progress_json=json.dumps(progress))
+        async def process_target(target: dict) -> None:
+            async with sem:
+                store_url = target["store_url"]
+                restaurant_name = target["restaurant"]
+                store_result = {"restaurant": restaurant_name, "store_url": store_url}
+                try:
+                    items = await asyncio.wait_for(
+                        ubereats_firecrawl.fetch_menu(store_url, restaurant_name=restaurant_name),
+                        timeout=store_timeout,
+                    )
+                    async with async_session_maker() as sess:
+                        ranked, unranked = await _persist_items(sess, items, restaurant_name, store_url, payload.location or "", auto_rank=payload.auto_rank)
+                        await sess.commit()
+                    result_payload["ranked_deals"].extend(ranked)
+                    result_payload["unranked_deals"].extend(unranked)
+                    store_result["status"] = "completed"
+                    store_result["items"] = len(items)
+                    async with progress_lock:
+                        progress["completed"] += 1
+                        progress["stores"].append(store_result)
+                except asyncio.TimeoutError:
+                    store_result["status"] = "failed"
+                    store_result["error"] = "timeout"
+                    async with progress_lock:
+                        progress["failed"] += 1
+                        progress["stores"].append(store_result)
+                except Exception as exc:
+                    logger.exception("Error scraping %s: %s", store_url, exc)
+                    store_result["status"] = "failed"
+                    store_result["error"] = str(exc)
+                    async with progress_lock:
+                        progress["failed"] += 1
+                        progress["stores"].append(store_result)
+                await _update_job(job_id, progress_json=json.dumps(progress))
 
-            await asyncio.gather(*[process_target(t) for t in store_targets])
+        await asyncio.gather(*[process_target(t) for t in store_targets])
 
         progress["stage"] = "finalizing"
         total_ranked = len(result_payload["ranked_deals"])
@@ -304,7 +294,11 @@ async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
             await _restore_snapshot(snapshot_data)
 
         status = "completed" if progress["failed"] == 0 else ("partial" if progress["completed"] > 0 else "failed")
-        result_payload["metadata"] = {"stores_attempted": len(store_targets), "deals_ranked": total_ranked}
+        result_payload["metadata"] = {
+            "stores_attempted": len(store_targets),
+            "deals_ranked": total_ranked,
+            "store_discovery_failures": discovery_failures,
+        }
 
     except Exception as exc:
         logger.exception("Fatal error in run_ubereats_job: %s", exc)
@@ -312,12 +306,8 @@ async def run_ubereats_job(job_id: str, payload: UberEatsImportRequest) -> dict:
         progress["stores"].append({"status": "failed", "error": str(exc)})
 
     finally:
-        finished = datetime.utcnow()
+        finished = utcnow()
         await _update_job(job_id, status=status, finished_at=finished, progress_json=json.dumps(progress), result_json=json.dumps(result_payload))
-        restaurants_list = payload.restaurants or SUPPORTED_RESTAURANTS
-        if payload.location:
-            key = _cache_key(payload.location, restaurants_list)
-            UBEREATS_CACHE[key] = {"job_id": job_id, "status": status, "progress": progress, "result": result_payload, "expires_at": datetime.utcnow() + timedelta(seconds=settings.ubereats_cache_ttl_seconds)}
 
     return {"status": status, "progress": progress, "result": result_payload}
 

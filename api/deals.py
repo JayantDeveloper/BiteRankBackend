@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from timeutil import utcnow
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -80,7 +80,7 @@ def _apply_scores(
         deal.protein_grams = provided_protein
     elif scores.get("protein_grams") is not None:
         deal.protein_grams = scores["protein_grams"]
-    deal.last_ranked_at = datetime.utcnow()
+    deal.last_ranked_at = utcnow()
 
 
 @router.get("/deals", response_model=List[DealResponse])
